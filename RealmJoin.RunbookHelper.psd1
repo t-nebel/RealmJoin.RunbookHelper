@@ -2,7 +2,7 @@
 
 @{
     RootModule        = 'RealmJoin.RunbookHelper.psm1'
-    ModuleVersion     = '0.8.4'
+    ModuleVersion     = '0.8.5'
     GUID              = '50c59179-6cb8-4968-bf76-e7de04f02957'
     Author            = 'glueckkanja AG'
     CompanyName       = 'glueckkanja AG'
@@ -16,7 +16,7 @@
         'Use-RjRbInterface', 'Write-RjRbLog', 'Write-RjRbDebug',
         'Invoke-RjRbRestMethod', 'Invoke-RjRbRestMethodGraph', 'Invoke-RjRbRestMethodDefenderATP',
         'Connect-RjRbAzAccount', 'Connect-RjRbAzureAD', 'Get-RjRbAzureADTenantDetail', 'Connect-RjRbExchangeOnline',
-        'Connect-RjRbGraph', 'Connect-RjRbDefenderATP'
+        'Connect-RjRbGraph', 'Connect-RjRbDefenderATP', 'Send-RjReportEmail'
     )
     CmdletsToExport   = @()
     AliasesToExport   = @('Use-RJInterface')
