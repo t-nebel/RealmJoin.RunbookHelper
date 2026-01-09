@@ -1046,6 +1046,8 @@ function Send-RjReportEmail {
 
         [string[]]$Attachments = @(),
 
+        [bool]$saveToSentItems = $true,
+
         [string]$TenantDisplayName,
 
         [string]$ReportVersion
@@ -1121,10 +1123,13 @@ function Send-RjReportEmail {
                 $message.attachments = $emailAttachments
             }
 
-            # Send via Graph API using native Microsoft Graph
-            $body = @{ message = $message; saveToSentItems = $true } | ConvertTo-Json -Depth 10
-            $Uri = "https://graph.microsoft.com/v1.0/users/$($EmailFrom)/sendMail"
-            Invoke-MgGraphRequest -Uri $Uri -Method POST -Body $body -ContentType "application/json" -ErrorAction Stop
+            # Send via Graph API
+            #$body = @{ message = $message; saveToSentItems = $true } | ConvertTo-Json -Depth 10
+            #$Uri = "https://graph.microsoft.com/v1.0/users/$($EmailFrom)/sendMail"
+            #Invoke-MgGraphRequest -Uri $Uri -Method POST -Body $body -ContentType "application/json" -ErrorAction Stop
+            $Resource = "/users/$($EmailFrom)/sendMail"
+            $body = @{ message = $message; saveToSentItems = $saveToSentItems }
+            Invoke-RjRbRestMethodGraph -Resource $Resource -Method POST -Body $body -ErrorAction Stop
 
             Write-RjRbLog -Message "Email sent successfully to $recipient" -Verbose
             $successfulSends++
