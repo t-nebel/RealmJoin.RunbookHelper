@@ -79,10 +79,10 @@ function Resolve-RjRbImageSource {
 
     $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
     $contentType = switch ($extension) {
-        '.png'  { 'image/png' }
-        '.jpg'  { 'image/jpeg' }
+        '.png' { 'image/png' }
+        '.jpg' { 'image/jpeg' }
         '.jpeg' { 'image/jpeg' }
-        '.gif'  { 'image/gif' }
+        '.gif' { 'image/gif' }
         default { throw "Unsupported image type '$extension' for $Path. Use PNG, JPG or GIF." }
     }
 
@@ -93,20 +93,54 @@ function Resolve-RjRbImageSource {
     }
 }
 
-function ConvertFrom-MarkdownToHtml {
+function Add-RjRbCellSoftBreaks {
+    <#
+        .SYNOPSIS
+        Inserts zero-width-space break opportunities into overlong unbreakable
+        table-cell tokens.
+
+        .DESCRIPTION
+        The Outlook Classic (Word) engine does not break long words inside
+        table cells; a single unbreakable token wider than its column makes
+        Word grow the whole table - and with it the fixed 750px email card -
+        past the header/footer banners. This helper inserts U+200B zero-width
+        spaces every 10 characters into runs of 30+ characters that contain no
+        natural break points (. @ / - &). Word and modern clients treat U+200B
+        as an invisible line-break opportunity. Only text nodes are touched -
+        never markup, attributes or URLs. Trade-off: copying such a
+        (pathological) value out of the mail includes the invisible U+200B
+        characters; realistic serials, device names, mail addresses and URLs
+        stay untouched because they are either shorter than 30 characters or
+        wrap naturally at their punctuation.
+    #>
+    param([string]$Html)
+    if ([string]::IsNullOrEmpty($Html)) { return $Html }
+    return [regex]::Replace($Html, '(?<=^|>)[^<>]+(?=<|$)', {
+        param($m)
+        [regex]::Replace($m.Value, '[^\s<>&.@/\-]{30,}', {
+            param($t)
+            # 10-char chunks (~70px at 14px font) fit even the narrowest
+            # generated column, so Word never needs to grow the table
+            $chunks = [regex]::Matches($t.Value, '.{1,10}') | ForEach-Object { $_.Value }
+            [string]::Join([string][char]0x200B, $chunks)
+        })
+    })
+}
+
+function ConvertFrom-RjRbMarkdownToHtml {
     <#
         .SYNOPSIS
         Converts Markdown text to HTML with support for common Markdown syntax.
 
         .DESCRIPTION
         Lightweight Markdown to HTML converter supporting headers, lists, tables, code blocks,
-        links, images, bold, italic, blockquotes, and horizontal rules.
+        links, link buttons, images, bold, italic, blockquotes, and horizontal rules.
 
         .PARAMETER MarkdownText
         The Markdown text to convert to HTML.
 
         .EXAMPLE
-        PS C:\> ConvertFrom-MarkdownToHtml -MarkdownText "# Hello World`n`nThis is **bold** text."
+        PS C:\> ConvertFrom-RjRbMarkdownToHtml -MarkdownText "# Hello World`n`nThis is **bold** text."
 
         .OUTPUTS
         System.String. Returns HTML string.
@@ -159,9 +193,11 @@ function ConvertFrom-MarkdownToHtml {
 
         # Wrap in MSO-only table to add horizontal inset in Outlook Classic
         # (Word engine ignores border-radius, so without this the bg fills edge-to-edge)
-        # Use <pre> inside the td to preserve line breaks in Outlook Classic
-        $msoCode = $code -replace "`n", "`n"
-        $htmlBlock = "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"margin:20px 0;border-collapse:collapse;`"><tr><td bgcolor=`"#e8ebed`" style=`"background-color:#e8ebed;border:1px solid #e5e7eb;padding:20px;`"><pre style=`"margin:0;font-family:Consolas,'Courier New',monospace;font-size:13px;color:#011e33;white-space:pre;`">$msoCode</pre></td></tr></table><![endif]--><!--[if !mso]><!-->$preTag<!--<![endif]-->"
+        # Use <pre> inside the td to preserve line breaks in Outlook Classic.
+        # table-layout:fixed pins the table to the container width (Word's automatic
+        # layout would grow it to fit the longest code line); white-space:pre-wrap asks
+        # Word to wrap long lines instead of clipping them at the fixed cell edge.
+        $htmlBlock = "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"margin:20px 0;width:100%;table-layout:fixed;border-collapse:collapse;`"><tr><td bgcolor=`"#e8ebed`" style=`"background-color:#e8ebed;border:1px solid #e5e7eb;padding:20px;`"><pre style=`"margin:0;font-family:Consolas,'Courier New',monospace;font-size:13px;color:#011e33;white-space:pre-wrap;`">$code</pre></td></tr></table><![endif]--><!--[if !mso]><!-->$preTag<!--<![endif]-->"
 
         $placeholder = "§CODEBLOCK§$codeBlockIndex§"
         $codeBlocks += $htmlBlock
@@ -182,22 +218,85 @@ function ConvertFrom-MarkdownToHtml {
         return $placeholder
     }
 
-    # Horizontal rules - use color/size/noshade attributes for Outlook Classic
-    $html = $html -replace '(?m)^(-{3,}|\*{3,}|_{3,})$', '<!--[if mso]><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0;"><tr><td style="border-top:2px solid #e5e7eb;font-size:1px;line-height:1px;" height="1">&nbsp;</td></tr></table><![endif]--><!--[if !mso]><!--><hr style="border:none;border-top:2px solid #e5e7eb;margin:24px 0;height:0;" /><!--<![endif]-->'
+    # Extract and protect link buttons before the generic link processing below
+    # Syntax:  [Label](https://url){button}
+    # Example: [Approve](url1){button} [Reject](url2){button}
+    # Multiple buttons are rendered in the same row.
+    # Rounded button corners are only supported in modern clients (e.g. Outlook New, OWA, mobile Outlook app). 
+    # Outlook Classic (Word engine) renders square button corners.
+    $buttonRows = @()
+    $buttonRowIndex = 0
+    $html = $html -replace '(?m)^[ \t]*(?:\[[^\]]+\]\([^)]+\)\{\s*button\s*\}[ \t]*)+$', {
+        $line = $_.Value
+        $buttons = [regex]::Matches($line, '\[([^\]]+)\]\(([^)]+)\)\{\s*button\s*\}')
+
+        $count = $buttons.Count
+        $cellPercent = [int]([Math]::Floor(100 / $count))
+        $msoCells = [System.Collections.Generic.List[string]]::new()
+        $webButtons = [System.Collections.Generic.List[string]]::new()
+        $tableReset = 'border:none;border-collapse:collapse;box-shadow:none;border-radius:0;background:none;'
+        for ($i = 0; $i -lt $count; $i++) {
+            $button = $buttons[$i]
+            $label = $button.Groups[1].Value.Trim() -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+            $href = $button.Groups[2].Value.Trim() -replace '&', '&amp;' -replace '"', '&quot;'
+
+            # Outlook Classic (Word engine) buttons are rendered as table cells with 100% width divided equally between them. 
+            # To prevent the buttons from sticking together, add left/right padding to all but the outer edges of the button group.
+            $msoPad = if ($count -le 1) { 'padding:0;' }
+            elseif ($i -eq 0) { 'padding:0 6px 0 0;' }
+            elseif ($i -eq ($count - 1)) { 'padding:0 0 0 6px;' }
+            else { 'padding:0 6px;' }
+            $msoCells.Add("<td width=`"$cellPercent%`" valign=`"top`" style=`"${msoPad}border:none;background:none;`"><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"width:100%;table-layout:fixed;$tableReset`"><tr><td bgcolor=`"#f8842c`" align=`"center`" valign=`"middle`" style=`"mso-padding-alt:14px 8px;padding:14px 8px;border:none;`"><a href=`"$href`" style=`"font-family:'Segoe UI',Arial,sans-serif;font-size:16px;font-weight:bold;line-height:16px;color:#ffffff;text-decoration:none;mso-line-height-rule:exactly;`">$label</a></td></tr></table></td>")
+
+            # Modern clients support flexible button widths and rounded corners. 
+            # Render buttons as links with padding and background color, wrapped in a flex container to allow wrapping if there are many buttons or the labels are long.
+            $webButtons.Add("<a href=`"$href`" target=`"_blank`" rel=`"noopener noreferrer`" style=`"flex:1 1 200px;box-sizing:border-box;margin:6px;background-color:#f8842c;border-radius:8px;color:#ffffff;font-family:'Miriam Libre','Segoe UI',Arial,sans-serif;font-size:16px;font-weight:700;line-height:1;text-align:center;text-decoration:none;padding:14px 8px;`">$label</a>")
+        }
+
+        # Outlook Classic (Word engine) requires tables for complex layouts, so render buttons in a table row with one cell per button.
+        # Use a nested table for the button styling to prevent Word from stripping styles on the outer cell.
+        $msoRow = "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"width:100%;table-layout:fixed;$tableReset`"><tr>$([string]::Join('', $msoCells))</tr></table><![endif]-->"
+        # Modern email clients support more flexible layouts and better CSS support, so render buttons as styled links in a flex container that allows wrapping if needed.
+        $webRow = "<!--[if !mso]><!--><div style=`"display:flex;flex-wrap:wrap;margin:-6px;`">$([string]::Join('', $webButtons))</div><!--<![endif]-->"
+        $row = "$msoRow$webRow"
+
+        $placeholder = "§BUTTONROW§$buttonRowIndex§"
+        $buttonRows += $row
+        $buttonRowIndex++
+        return $placeholder
+    }
+
+    # Horizontal rules - split per engine. Outlook Classic (Word) does not reliably
+    # render <hr> (border CSS suppresses it, the size/color attributes alone draw
+    # nothing here), so the mso branch uses a 1-cell table whose top border is the
+    # line. That cell would otherwise inherit the data-table rules .content table
+    # (border-radius/box-shadow/background -> rounded pill) and .content td
+    # (border-bottom -> a second line), so both are reset inline (inline beats the
+    # class selectors). Modern clients ignore the mso branch and use the plain <hr>.
+    $html = $html -replace '(?m)^(-{3,}|\*{3,}|_{3,})$', '<!--[if mso]><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:16px 0;width:100%;table-layout:fixed;border:0;border-collapse:collapse;background:transparent;mso-table-lspace:0pt;mso-table-rspace:0pt;"><tr><td style="border:0;border-top:2px solid #e5e7eb;font-size:0;line-height:0;mso-line-height-rule:exactly;background:transparent;">&nbsp;</td></tr></table><![endif]--><!--[if !mso]><!--><hr style="border:0;border-top:2px solid #e5e7eb;margin:16px 0;" /><!--<![endif]-->'
 
     # Headers (all 6 levels) - now safe from code block interference
     # Also supports headers without space after # (e.g., #Header instead of # Header)
-    $html = $html -replace '(?m)^######\s*(.+)$', '<h6 style="color:#111827;margin-top:15px;margin-bottom:15px;font-size:16px;font-weight:800;">$1</h6>'
-    $html = $html -replace '(?m)^#####\s*(.+)$', '<h5 style="color:#111827;margin-top:15px;margin-bottom:15px;font-size:16px;font-weight:800;">$1</h5>'
-    $html = $html -replace '(?m)^####\s*(.+)$', '<h4 style="color:#111827;margin-top:15px;margin-bottom:15px;font-size:16px;font-weight:800;">$1</h4>'
-    $html = $html -replace '(?m)^###\s*(.+)$', '<h3 style="color:#111827;margin-top:27px;margin-bottom:15px;font-size:18px;font-weight:800;">$1</h3>'
-    $html = $html -replace '(?m)^##\s*(.+)$', '<h2 style="color:#111827;margin-top:42px;margin-bottom:15px;font-size:22px;font-weight:800;">$1</h2>'
-    $html = $html -replace '(?m)^#\s*(.+)$', '<h1 style="color:#111827;border-bottom:2px solid #111827;padding-bottom:12px;margin-bottom:15px;font-size:26px;font-weight:800;">$1</h1>'
+    # mso-margin-*-alt mirror the margins for Outlook Classic (the Word engine ignores
+    # standard margin on headings, which otherwise glues the next paragraph to the heading).
+    $html = $html -replace '(?m)^######\s*(.+)$', '<h6 style="color:#111827;margin-top:15px;margin-bottom:15px;mso-margin-top-alt:15px;mso-margin-bottom-alt:15px;font-size:16px;font-weight:800;">$1</h6>'
+    $html = $html -replace '(?m)^#####\s*(.+)$', '<h5 style="color:#111827;margin-top:15px;margin-bottom:15px;mso-margin-top-alt:15px;mso-margin-bottom-alt:15px;font-size:16px;font-weight:800;">$1</h5>'
+    $html = $html -replace '(?m)^####\s*(.+)$', '<h4 style="color:#111827;margin-top:15px;margin-bottom:15px;mso-margin-top-alt:15px;mso-margin-bottom-alt:15px;font-size:16px;font-weight:800;">$1</h4>'
+    $html = $html -replace '(?m)^###\s*(.+)$', '<h3 style="color:#111827;margin-top:27px;margin-bottom:15px;mso-margin-top-alt:27px;mso-margin-bottom-alt:15px;font-size:18px;font-weight:800;">$1</h3>'
+    $html = $html -replace '(?m)^##\s*(.+)$', '<h2 style="color:#111827;margin-top:42px;margin-bottom:15px;mso-margin-top-alt:42px;mso-margin-bottom-alt:15px;font-size:22px;font-weight:800;">$1</h2>'
+    # h1 carries a border-bottom; the Word engine drops its margin, gluing the next
+    # paragraph to the rule. Recreate the gap with an MSO-only line-height spacer div
+    # (the pattern used in the HTML templates) - a spacer *table* adds Word's own
+    # space-before/after and overshoots.
+    $html = $html -replace '(?m)^#\s*(.+)$', '<h1 style="color:#111827;border-bottom:2px solid #111827;padding-bottom:12px;margin-bottom:15px;mso-margin-top-alt:0;font-size:26px;font-weight:800;">$1</h1><!--[if mso]><div style="line-height:15px;font-size:0;mso-line-height-rule:exactly;">&nbsp;</div><![endif]-->'
 
     # Bold and Italic (limit to single line to prevent backtracking)
     $html = $html -replace '\*\*([^\n\r*]+)\*\*', '<strong>$1</strong>'
     $html = $html -replace '\*([^\n\r*]+)\*', '<em>$1</em>'
     $html = $html -replace '~~([^\n\r~]+)~~', '<span style="text-decoration:line-through;">$1</span>'
+
+    # Explicit line breaks may by forced with <br>, <br/> or <br />
+    $html = $html -replace '(?i)<br\s*/?>', '<br>'
 
     # Links and Images
     $html = $html -replace '!\[([^\]]*)\]\(([^)]+)\)', '<img src="$2" alt="$1"/>'
@@ -231,7 +330,8 @@ function ConvertFrom-MarkdownToHtml {
                 # Nested lists: no top/bottom margin to prevent extra spacing in Outlook New
                 $nestedStyle = if ($ListType -eq 'ul') {
                     'style="margin:0;padding-left:20px;list-style-type:disc;"'
-                } else {
+                }
+                else {
                     'style="margin:0;padding-left:20px;list-style-type:decimal;"'
                 }
                 $ProcessedLines.Value += "<$ListType $nestedStyle>"
@@ -307,15 +407,15 @@ function ConvertFrom-MarkdownToHtml {
 
                 if ($admonitionType) {
                     $palette = switch ($admonitionType) {
-                        'NOTE'      { @{ Accent = '#3b82f6'; Title = 'Note';      Glyph = '&#9432;' } }
-                        'TIP'       { @{ Accent = '#10b981'; Title = 'Tip';       Glyph = '&#128161;' } }
+                        'NOTE' { @{ Accent = '#3b82f6'; Title = 'Note'; Glyph = '&#9432;' } }
+                        'TIP' { @{ Accent = '#10b981'; Title = 'Tip'; Glyph = '&#128161;' } }
                         'IMPORTANT' { @{ Accent = '#8b5cf6'; Title = 'Important'; Glyph = '&#10071;' } }
-                        'WARNING'   { @{ Accent = '#f59e0b'; Title = 'Warning';   Glyph = '&#9888;' } }
-                        'CAUTION'   { @{ Accent = '#ef4444'; Title = 'Caution';   Glyph = '&#9940;' } }
+                        'WARNING' { @{ Accent = '#f59e0b'; Title = 'Warning'; Glyph = '&#9888;' } }
+                        'CAUTION' { @{ Accent = '#ef4444'; Title = 'Caution'; Glyph = '&#9940;' } }
                     }
                     # Same MSO/non-MSO wrapper pattern as a plain blockquote, but
                     # no italics and a per-type accent colour on the left border.
-                    $processedLines += "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"margin:15px 0;`"><tr><td bgcolor=`"#e8ebed`" style=`"background-color:#e8ebed;border-left:4px solid $($palette.Accent);padding:10px 24px;color:#374151;`" valign=`"top`"><![endif]-->"
+                    $processedLines += "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"margin:15px 0;width:100%;table-layout:fixed;`"><tr><td bgcolor=`"#e8ebed`" style=`"background-color:#e8ebed;border-left:4px solid $($palette.Accent);padding:10px 24px;color:#374151;`" valign=`"top`"><![endif]-->"
                     $processedLines += "<!--[if !mso]><!--><blockquote style=`"border-left:4px solid $($palette.Accent);background-color:#e8ebed;padding:10px 24px;margin:15px 0;color:#374151;border-radius:0 8px 8px 0;`"><!--<![endif]-->"
                     $processedLines += "<p style=`"margin:0 0 8px 0;font-weight:700;color:$($palette.Accent);font-size:14px;`">$($palette.Glyph) $($palette.Title)</p>"
                     $inBlockquote = $true
@@ -325,7 +425,7 @@ function ConvertFrom-MarkdownToHtml {
                 # MSO-only table wrapper for blockquote background (Word engine ignores background-color on blockquote)
                 # Use border-left on a single td rather than a separate narrow td (Outlook enforces min cell width)
                 # Hide the <blockquote> from MSO so only the table renders (inline styles override !important in Word engine)
-                $processedLines += '<!--[if mso]><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:15px 0;"><tr><td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid #3b82f6;padding:0 24px;font-style:italic;color:#374151;" valign="top"><![endif]-->'
+                $processedLines += '<!--[if mso]><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:15px 0;width:100%;table-layout:fixed;"><tr><td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid #3b82f6;padding:0 24px;font-style:italic;color:#374151;" valign="top"><![endif]-->'
                 $processedLines += '<!--[if !mso]><!--><blockquote style="border-left:4px solid #3b82f6;background-color:#e8ebed;padding:10px 24px;margin:15px 0;font-style:italic;color:#374151;"><!--<![endif]-->'
                 $inBlockquote = $true
             }
@@ -340,10 +440,85 @@ function ConvertFrom-MarkdownToHtml {
             Close-AllList -ListStack ([ref]$listStack) -ProcessedLines ([ref]$processedLines) -InUnorderedList ([ref]$inUnorderedList) -InOrderedList ([ref]$inOrderedList)
 
             if (-not $inTable) {
-                $processedLines += '<div class="table-wrapper" style="margin:15px 0;">'
+                # mso-margin-bottom-alt:0 stops the Word engine from stacking this wrapper's
+                # bottom margin on top of the next heading's (large) top margin - Word does
+                # not collapse adjacent margins the way browsers/OWA do, so without it the
+                # gap after a table looks bigger than the gap after a paragraph.
+                $processedLines += '<div class="table-wrapper" style="margin:15px 0;mso-margin-bottom-alt:0;">'
                 $processedLines += '<table class="table table-striped" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;background-color:white;border:1px solid #e8ebed;">'
                 $inTable = $true
                 $tableRowIndex = 0
+
+                # Outlook Classic renders this table with table-layout:fixed (MSO style
+                # block backstop), which defaults to EQUAL column widths - a short
+                # column (date) would wrap while a long column wastes space. In fixed
+                # layout Word takes column widths from <col> elements, and the
+                # converter sees every cell up front - so scan the whole table ahead
+                # and emit an MSO-only <col> set with content-proportional widths.
+                # Modern clients skip the conditional comment and keep auto layout.
+                $colMaxChars = [System.Collections.Generic.List[int]]::new()
+                for ($la = $i; $la -lt $lineCount -and $lines[$la] -match '^\|.*\|$'; $la++) {
+                    if ($lines[$la] -match '^\|[-:\s\|]+\|$') { continue }   # alignment separator row
+                    $laCells = ($lines[$la] -replace '^\|', '' -replace '\|$', '').Split('|')
+                    for ($lc = 0; $lc -lt $laCells.Count; $lc++) {
+                        # Visible-length estimate: resolve inline-code placeholders to
+                        # their real text, strip html tags (links/bold are converted by
+                        # now), count entities and escaped pipes as one character.
+                        $visible = $laCells[$lc].Trim()
+                        $visible = $visible -replace '§INLINECODE§(\d+)§', { 'x' * (($inlineCodeBlocks[[int]$_.Groups[1].Value] -replace '<[^>]+>', '').Length) }
+                        $visible = $visible -replace '<[^>]+>', '' -replace '§ESCAPEDPIPE§|&[A-Za-z]+;|&#\d+;', 'x' -replace '§ESCAPED§', ''
+                        while ($colMaxChars.Count -le $lc) { $colMaxChars.Add(0) }
+                        if ($visible.Length -gt $colMaxChars[$lc]) { $colMaxChars[$lc] = $visible.Length }
+                    }
+                }
+                $tableColPcts = @()
+                $tableColPctsPending = $false
+                if ($colMaxChars.Count -ge 2) {
+                    # Pixel need per column: clamped char count x ~7px (14px
+                    # proportional font) plus the 2x16px cell padding. Distribute the
+                    # ~650px content width max-min fair: every column that fits keeps
+                    # exactly its need (dates never wrap), oversized columns split the
+                    # remainder equally among themselves.
+                    $colPxNeed = @($colMaxChars | ForEach-Object { [Math]::Min([Math]::Max($_, 3), 60) * 7 + 32 })
+                    $colPx = @(0.0) * $colPxNeed.Count
+                    $avail = 650.0
+                    $active = @(0..($colPxNeed.Count - 1))
+                    while ($active.Count -gt 0) {
+                        $fair = $avail / $active.Count
+                        $fits = @($active | Where-Object { $colPxNeed[$_] -le $fair })
+                        if ($fits.Count -eq 0) { foreach ($ci in $active) { $colPx[$ci] = $fair }; break }
+                        foreach ($ci in $fits) { $colPx[$ci] = $colPxNeed[$ci]; $avail -= $colPxNeed[$ci] }
+                        $active = @($active | Where-Object { $colPxNeed[$_] -gt $fair })
+                    }
+                    # Integer percentages summing to exactly 100 (largest remainder;
+                    # a sub-650px total just scales up proportionally via the divide).
+                    # The widths are applied as inline style="width:N%" on the cells
+                    # of the table's FIRST row (below) - NOT as <col>/<colgroup>
+                    # elements: Word's HTML reader keeps only the first column
+                    # element of a run and foster-parents the rest into the first
+                    # header cell, silently dropping their widths. Verified three
+                    # times via Outlook's save-as-HTML output (bare <col/> run,
+                    # [if mso]-wrapped <colgroup>, and a plain unconditional
+                    # <colgroup> all got relocated). Inline cell widths are Word's
+                    # own native format and are applied reliably; Word uses them as
+                    # its fixed column grid and wraps long tokens inside the cell
+                    # instead of growing the table past the 750px card. Modern
+                    # clients treat them as proportional hints in auto layout
+                    # (deliberate, minor rendering change - the proportions are
+                    # derived from the same cell contents auto layout would
+                    # measure), and .table-wrapper keeps its horizontal scroll on
+                    # small screens.
+                    $pxSum = ($colPx | Measure-Object -Sum).Sum
+                    $raw = @($colPx | ForEach-Object { 100.0 * $_ / $pxSum })
+                    $pct = @($raw | ForEach-Object { [int][Math]::Floor($_) })
+                    $rest = 100 - ($pct | Measure-Object -Sum).Sum
+                    foreach ($ci in (0..($raw.Count - 1) | Sort-Object { [Math]::Floor($raw[$_]) - $raw[$_] })) {
+                        if ($rest -le 0) { break }
+                        $pct[$ci]++; $rest--
+                    }
+                    $tableColPcts = $pct
+                    $tableColPctsPending = $true
+                }
 
                 # Check for separator line with alignment
                 if (($i + 1) -lt $lineCount -and $lines[$i + 1] -match '^\|[-:\s\|]+\|$') {
@@ -363,12 +538,16 @@ function ConvertFrom-MarkdownToHtml {
                     if ($cells.Count -gt 0) {
                         $processedLines += '<thead><tr bgcolor="#f8842c" style="background-color:#f8842c;">'
                         for ($j = 0; $j -lt $cells.Count; $j++) {
-                            $cleanCell = $cells[$j].Trim()
+                            $cleanCell = Add-RjRbCellSoftBreaks -Html $cells[$j].Trim()
                             if ([string]::IsNullOrWhiteSpace($cleanCell)) { $cleanCell = '&nbsp;' }
                             $alignClass = if ($j -lt $tableAlignments.Count -and $tableAlignments[$j]) { " class=`"text-$($tableAlignments[$j])`"" } else { "" }
-                            $processedLines += "<th$alignClass style=`"background-color:#f8842c;color:#ffffff;padding:8px 16px;font-weight:600;font-size:14px;`">$cleanCell</th>"
+                            # width:N% first in the style attr - the header row defines
+                            # Word's column grid (see width computation comment above)
+                            $widthStyle = if ($tableColPctsPending -and $j -lt $tableColPcts.Count) { "width:$($tableColPcts[$j])%;" } else { '' }
+                            $processedLines += "<th$alignClass style=`"${widthStyle}background-color:#f8842c;color:#ffffff;padding:8px 16px;font-weight:600;font-size:14px;`">$cleanCell</th>"
                         }
                         $processedLines += '</tr></thead><tbody>'
+                        $tableColPctsPending = $false
                         $i++
                         continue
                     }
@@ -382,13 +561,17 @@ function ConvertFrom-MarkdownToHtml {
                 $rowBgAttr = if ($tableRowIndex % 2 -eq 0) { ' bgcolor="#e8ebed" style="background-color:#e8ebed;"' } else { '' }
                 $processedLines += "<tr$rowBgAttr>"
                 for ($j = 0; $j -lt $cells.Count; $j++) {
-                    $cleanCell = $cells[$j].Trim()
+                    $cleanCell = Add-RjRbCellSoftBreaks -Html $cells[$j].Trim()
                     if ([string]::IsNullOrWhiteSpace($cleanCell)) { $cleanCell = '&nbsp;' }
                     $alignStyle = if ($j -lt $tableAlignments.Count -and $tableAlignments[$j]) { "text-align:$($tableAlignments[$j]);" } else { "" }
                     $alignClass = if ($j -lt $tableAlignments.Count -and $tableAlignments[$j]) { " class=`"text-$($tableAlignments[$j])`"" } else { "" }
-                    $processedLines += "<td$alignClass style=`"padding:8px 16px;border-bottom:1px solid #e8ebed;font-size:14px;color:#2D3748;${alignStyle}`">$cleanCell</td>"
+                    # Only set for the first row of a headerless table (no separator
+                    # line): that row then defines Word's column grid instead of a thead
+                    $widthStyle = if ($tableColPctsPending -and $j -lt $tableColPcts.Count) { "width:$($tableColPcts[$j])%;" } else { '' }
+                    $processedLines += "<td$alignClass style=`"${widthStyle}padding:8px 16px;border-bottom:1px solid #e8ebed;font-size:14px;color:#2D3748;${alignStyle}`">$cleanCell</td>"
                 }
                 $processedLines += '</tr>'
+                $tableColPctsPending = $false
             }
         }
         # Unordered List processing
@@ -423,7 +606,12 @@ function ConvertFrom-MarkdownToHtml {
                     # border-collapse + explicit border:0 on every cell is
                     # required - Outlook New otherwise paints faint default
                     # cell borders even with border="0" on the table.
-                    $processedLines += '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:15px 0 12px 20px;border-collapse:collapse;border:0;background:transparent;">'
+                    # table-layout:auto is a no-op in modern clients (a widthless table
+                    # computes as auto layout anyway) but shields this table from the
+                    # MSO-block "table { table-layout:fixed }" backstop in Outlook
+                    # Classic, which would otherwise freeze the glyph column at the
+                    # width of the first row.
+                    $processedLines += '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:15px 0 12px 20px;border-collapse:collapse;border:0;background:transparent;table-layout:auto;">'
                     $inTaskTable = $true
                 }
 
@@ -569,12 +757,20 @@ function ConvertFrom-MarkdownToHtml {
         # Check if block starts with an HTML element tag (opening or closing)
         if ($block -match "^<(h[1-6]|ul|ol|table|pre|blockquote|hr)[\s>]" -or
             $block -match "^</(h[1-6]|ul|ol|table|pre|blockquote)>" -or
-            $block -match '§CODEBLOCK§') {
+            $block -match '§CODEBLOCK§' -or
+            $block -match '§BUTTONROW§') {
             $result += $block
         }
         # Check if it contains HTML list elements - if so, don't wrap
         elseif ($block -match "<(h[1-6]|ul|ol|li|table|thead|tbody|tr|td|th|pre|code|blockquote|hr|/ul|/ol)[\s>]") {
             $result += $block
+        }
+        # Check if block is only <br> tags to force line breaks
+        elseif ($block -match '^(?:<br>\s*)+$') {
+            $breakCount = ([regex]::Matches($block, '<br>')).Count
+            for ($b = 0; $b -lt $breakCount; $b++) {
+                $result += '<div style="line-height:16px;font-size:0;mso-line-height-rule:exactly;">&nbsp;</div>'
+            }
         }
         else {
             $lines = $block -split "`n"
@@ -595,20 +791,26 @@ function ConvertFrom-MarkdownToHtml {
     $html = $html -replace '§ESCAPEDPIPE§', '|'
     $html = $html -replace '§ESCAPED§(.{1})§ESCAPED§', '$1'
 
-    # Restore inline code blocks from placeholders
+    # Restore protected blocks from placeholders. String.Replace, NOT -replace:
+    # the stored fragments are user content, and regex substitution would treat
+    # $-sequences in them as substitution tokens ($_ = whole input, $& = match,
+    # $1 = group), duplicating the entire document or corrupting the output.
     for ($i = 0; $i -lt $inlineCodeBlocks.Count; $i++) {
-        $html = $html -replace "§INLINECODE§$i§", $inlineCodeBlocks[$i]
+        $html = $html.Replace("§INLINECODE§$i§", $inlineCodeBlocks[$i])
     }
 
-    # Restore code blocks from placeholders
     for ($i = 0; $i -lt $codeBlocks.Count; $i++) {
-        $html = $html -replace "§CODEBLOCK§$i§", $codeBlocks[$i]
+        $html = $html.Replace("§CODEBLOCK§$i§", $codeBlocks[$i])
+    }
+
+    for ($i = 0; $i -lt $buttonRows.Count; $i++) {
+        $html = $html.Replace("§BUTTONROW§$i§", $buttonRows[$i])
     }
 
     return $html
 }
 
-function Get-RjReportEmailBody {
+function Get-RjRbReportEmailBody {
     <#
         .SYNOPSIS
         Builds the RealmJoin-branded HTML email body used for report delivery.
@@ -623,6 +825,9 @@ function Get-RjReportEmailBody {
         .PARAMETER HtmlContent
         HTML fragment generated from Markdown that will be embedded in the email body.
 
+        .PARAMETER MarkdownText
+        Markdown text that will be converted to HTML and embedded in the email body.
+
         .PARAMETER Attachments
         Optional list of attachment file paths to surface in the "Attached Files" section.
 
@@ -632,6 +837,27 @@ function Get-RjReportEmailBody {
         .PARAMETER ReportVersion
         Optional report version string rendered in the tenant information box.
 
+        .PARAMETER IncludeTenantInfo
+        If set, includes the tenant information box in the email body, showing the TenantDisplayName and ReportVersion values.
+
+        .PARAMETER IncludeHeader
+        If set, includes the RealmJoin-branded header in the email body.
+
+        .PARAMETER HeaderAltText
+        Optional alt text for the header image. Defaults to 'RealmJoin - Insights on Demand'.
+
+        .PARAMETER IncludeFooter
+        If set, includes the RealmJoin-branded footer in the email body.
+
+        .PARAMETER FooterLink
+        Optional URL that overrides the hyperlink wrapping the footer image. Defaults to
+        'https://www.realmjoin.com'. The supplied value is used verbatim as the href and
+        title attributes of the footer anchor element.
+
+        .PARAMETER FooterAltText
+        Optional alt text for the footer image. Defaults to
+        'RealmJoin - Companion to Intune - Application Lifecycle and Management Automation Platform'. The supplied value is used verbatim as the alt attribute of the footer image.
+
         .OUTPUTS
         System.String. Returns the composed HTML email body.
     #>
@@ -639,8 +865,9 @@ function Get-RjReportEmailBody {
         [Parameter(Mandatory = $true)]
         [string]$Subject,
 
-        [Parameter(Mandatory = $true)]
         [string]$HtmlContent,
+
+        [string]$MarkdownText,
 
         [string[]]$Attachments = @(),
 
@@ -648,12 +875,22 @@ function Get-RjReportEmailBody {
 
         [string]$ReportVersion,
 
+        [switch]$IncludeTenantInfo,
+
         [switch]$IncludeHeader,
+
+        [string]$HeaderAltText = 'RealmJoin - Insights on Demand',
 
         [switch]$IncludeFooter,
 
-        [string]$FooterLink = 'https://www.realmjoin.com'
+        [string]$FooterLink = 'https://www.realmjoin.com',
+
+        [string]$FooterAltText = 'RealmJoin - Companion to Intune - Application Lifecycle and Management Automation Platform - Visit https://www.realmjoin.com'
     )
+
+    if ([string]::IsNullOrEmpty($HtmlContent) -and -not [string]::IsNullOrEmpty($MarkdownText)) {
+        $HtmlContent = ConvertFrom-RjRbMarkdownToHtml -MarkdownText $MarkdownText
+    }
 
     if (-not $Attachments) {
         $Attachments = @()
@@ -1001,23 +1238,24 @@ function Get-RjReportEmailBody {
         .email-container { max-width: 750px; }
     }
 
-    /* === DARK MODE (Outlook Classic Win32 only) ===
-       Outlook Classic ignores @media (prefers-color-scheme) and instead
-       auto-inverts light backgrounds at render time, annotating the
-       inverted elements with the proprietary attributes [data-ogsb]
-       (background) and [data-ogsc] (color). Outlook New / OWA / Apple
-       Mail / Gmail do NOT set these attributes — they use the
-       prefers-color-scheme block below. So these selectors target
-       Outlook Classic Dark Mode exclusively, without affecting any
-       other client. !important is required because Outlook's inversion
-       writes inline style attributes onto the element that would
-       otherwise win on specificity. Colors mirror the
-       prefers-color-scheme block so Classic and New look identical.
-       For these selectors to match, the target element must carry an
-       INLINE background-color (or bgcolor attribute) in the source —
-       Outlook only injects data-ogsb where it actually inverted an
-       explicit inline value. That is why body / .email-container /
-       .content carry inline bgcolor/background-color below. */
+    /* === DARK MODE ([data-ogsb]/[data-ogsc] annotations) ===
+       These attributes are injected by the Outlook.com / OWA / New Outlook
+       dark-mode transform - NOT by Outlook Classic. The Word engine
+       re-colors internally at render time without touching the DOM and does
+       not support attribute selectors at all, so these rules can only ever
+       match in the web/New Outlook renderers, as a counterweight to their
+       color inversion. A selector only matches where the transform actually
+       inverted an explicit inline background (bgcolor attribute or inline
+       background-color); elements without one (body, .email-container,
+       .content) never receive data-ogsb, so those selectors below are inert
+       today - kept for parity should the markup ever gain inline
+       backgrounds. Do NOT add inline backgrounds to body/.email-container
+       just to activate them: Gmail re-interprets body-level backgrounds and
+       could tint the whole page. Outlook Classic dark mode simply
+       auto-inverts our inline bgcolors (acceptable; the light VML page
+       background around the inverted card remains - known cosmetic
+       mismatch, out of scope). !important is required because the dark-mode
+       transform writes inline styles that would otherwise win. */
     body[data-ogsb] { background-color: #1a1a1a !important; }
 
     .email-container[data-ogsb],
@@ -1103,24 +1341,45 @@ function Get-RjReportEmailBody {
 <!-- Outlook Classic Fixes (only for MSO) -->
 <!--[if mso]>
 <style type="text/css">
-    /* Force Light Mode for Outlook Classic */
-    body { background-color: #e8ebed; }
+    /* Force Light Mode for Outlook Classic. The surround is deliberately
+       WHITE here (not #e8ebed like modern clients): Word lays the mail out
+       on its Letter page model (~627px usable), so the 750px card overflows
+       the page to the right - a tiled grey background would only cover the
+       page area and leave a white strip beside the card (patchwork effect).
+       A uniform white surround with the card's 1px border looks clean;
+       centering is impossible in Classic for the same reason (card wider
+       than Word's page content area). Modern clients keep the grey,
+       centered layout from the main style block. */
+    body { background-color: #ffffff; }
     .email-container { background-color: #ffffff; width: 750px; }
-    .content { background-color: #ffffff; mso-padding-alt: 48px; }
+    /* padding:0 - the MSO inner wrapper td carries the 48px content padding;
+       Word builds that honor div padding would otherwise double it to 96px. */
+    .content { background-color: #ffffff; padding: 0; }
 
     /* MSO Font Fallback - Outlook Classic cannot load Google Fonts */
     body, p, li, td, th, h1, h2, h3, h4, h5, h6, div, span, a, blockquote {
         font-family: 'Segoe UI', Arial, Helvetica, sans-serif !important;
     }
 
-    /* MSO Table Fixes */
-    table { mso-table-lspace: 0pt; mso-table-rspace: 0pt; border-collapse: collapse; }
-
-    /* MSO Line Height Fix */
-    .content p, .content li, .content td, .content th {
-        mso-line-height-rule: exactly;
-        line-height: 1.6;
-    }
+    /* MSO Table Fixes + width lock backstop.
+       The Word engine uses automatic table layout and grows a table to fit
+       its widest cell, ignoring width="100%". A wide table would stretch the
+       .content cell and push the card past the fixed-width 750px header and
+       footer images, leaving an empty strip beside them. table-layout:fixed
+       makes Word honor declared widths and wrap long cell values natively at
+       the cell boundary (word-break/overflow-wrap CSS are no-ops in Word -
+       fixed layout is the actual wrapping mechanism).
+       IMPORTANT: Word applies element and class selectors reliably, but
+       descendant selectors like ".content table" only unreliably - never
+       hang critical rules on a descendant selector in this block. The
+       critical layers are the inline table-layout:fixed styles on the outer
+       750px wrapper, the inner content wrapper and every MSO-only twin
+       table; the two rules below are the backstop for the markdown data
+       tables (class "table") and for any table inside caller-supplied
+       HtmlContent. A table that must keep automatic layout opts out via
+       inline table-layout:auto (see the task-list table). */
+    table { mso-table-lspace: 0pt; mso-table-rspace: 0pt; border-collapse: collapse; table-layout: fixed; }
+    .table { table-layout: fixed; }
 
     /* MSO Heading Spacing - Word engine uses its own spacing without these */
     h1 { mso-margin-top-alt: 0; mso-margin-bottom-alt: 15px; mso-line-height-rule: exactly; }
@@ -1131,10 +1390,9 @@ function Get-RjReportEmailBody {
     /* MSO Paragraph Spacing */
     p { mso-margin-top-alt: 0; mso-margin-bottom-alt: 15px; }
 
-    /* MSO Container Width Fix */
-    .email-container { width: 750px !important; }
-
-    /* MSO tenant-info / attachments box - table wrapper handles styling, suppress on div */
+    /* MSO tenant-info / attachments box - table wrapper handles styling, suppress on div.
+       Dead for module-generated mail (these divs exist only in non-mso branches) -
+       kept as insurance for caller-supplied HtmlContent. */
     .tenant-info, .attachments {
         border: none !important;
         border-left: none !important;
@@ -1166,7 +1424,6 @@ function Get-RjReportEmailBody {
     .content li {
         margin-left: 0;
         padding-left: 8px;
-        mso-list: l0 level1 lfo1;
     }
 
     /* MSO HR Fix */
@@ -1176,46 +1433,59 @@ function Get-RjReportEmailBody {
 <![endif]-->
 </head>
 <body>
-    <!--[if mso]>
-    <v:background xmlns:v="urn:schemas-microsoft-com:vml" fill="t">
-        <v:fill type="tile" color="#e8ebed"/>
-    </v:background>
-    <![endif]-->
 
     <!--[if mso]>
-    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="750" align="center" style="width:750px;border-collapse:collapse;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="750" align="center" style="width:750px;table-layout:fixed;border-collapse:collapse;">
     <tr>
-    <td style="background-color:#ffffff;border:1px solid #d1d5db;">
+    <td width="750" style="width:750px;background-color:#ffffff;border:1px solid #d1d5db;">
     <![endif]-->
     <div class="email-container">
         $(if ($IncludeHeader) {
-            @'
-        <div class="header">
-            <img class="header-img" src="cid:header" alt="RealmJoin – Insights on Demand" width="750" height="200" />
+            @"
+        <div class='header'>
+            <!-- keep src/alt/width of the mso and non-mso img in sync -->
+            <!--[if mso]><img src='cid:header' alt='$HeaderAltText' width='750' style='width:750px;display:block;border:0;' /><![endif]-->
+            <!--[if !mso]><!--><img class='header-img' src='cid:header' alt='$HeaderAltText' width='750' /><!--<![endif]-->
         </div>
-'@
+"@
         })
 
         <div class="content">
             <!--[if mso]>
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;">
             <tr>
             <td style="padding:48px;">
             <![endif]-->
 
             $($HtmlContent)
 
+            $(if ($IncludeTenantInfo) {
+                @'
             <!--[if mso]>
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-top:32px;border-collapse:collapse;"><tr>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-top:32px;width:100%;table-layout:fixed;border-collapse:collapse;"><tr>
             <td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid #f8842c;padding:6px 20px;font-size:14px;" valign="top">
             <![endif]-->
             <!--[if !mso]><!-->
             <div class="tenant-info" style="background:#e8ebed;border:1px solid #e0e7ff;border-left:4px solid #f8842c;padding:10px 20px;border-radius:8px;font-size:14px;margin-top:32px;">
             <!--<![endif]-->
                 <p style="margin:0;padding:0;mso-line-height-rule:exactly;">
-                    <strong>Tenant:</strong> $($TenantDisplayName)<br>
-                    <strong>Generated:</strong> $([System.Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'; Get-Date -Format "dddd, MMMM d, yyyy HH:mm") <br>
-                    <strong>Report Version:</strong> $($ReportVersion)
+'@
+            })
+
+            $(if ($IncludeTenantInfo -and -not [string]::IsNullOrEmpty($TenantDisplayName)) {
+                    "<strong>Tenant:</strong> $($TenantDisplayName)"
+            })
+
+            $(if ($IncludeTenantInfo -and -not [string]::IsNullOrEmpty($TenantDisplayName) -and -not [string]::IsNullOrEmpty($ReportVersion)) {
+                "<br>"
+            })
+            
+            $(if ($IncludeTenantInfo -and -not [string]::IsNullOrEmpty($ReportVersion)) {
+                "<strong>Report Version:</strong> $($ReportVersion)<br><strong>Generated:</strong> $([System.Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'; Get-Date -Format "dddd, MMMM d, yyyy HH:mm")"
+            })
+            
+            $(if ($IncludeTenantInfo) {
+                @'
                 </p>
             <!--[if !mso]><!-->
             </div>
@@ -1223,13 +1493,15 @@ function Get-RjReportEmailBody {
             <!--[if mso]>
             </td></tr></table>
             <![endif]-->
+'@
+            })
 
             $(if (@($Attachments).Count -gt 0) {
             @"
 
             <!--[if mso]>
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"><tr><td style="font-size:1px;line-height:16px;height:16px;">&nbsp;</td></tr></table>
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="border-collapse:collapse;"><tr>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="width:100%;table-layout:fixed;"><tr><td style="font-size:1px;line-height:16px;height:16px;">&nbsp;</td></tr></table>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;"><tr>
             <td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid #f8842c;padding:6px 20px;font-size:14px;" valign="top">
             <![endif]-->
             <!--[if !mso]><!-->
@@ -1256,14 +1528,12 @@ function Get-RjReportEmailBody {
         </div>
 
         $(if ($IncludeFooter) {
-            @"
-        <!--[if mso]>
-        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"><tr><td style="font-size:1px;line-height:24px;height:24px;">&nbsp;</td></tr></table>
-        <![endif]-->
-        <!--[if !mso]><!--><div style="height:24px;line-height:24px;font-size:1px;">&nbsp;</div><!--<![endif]-->
+            @"        
         <div class="footer">
             <a href="$FooterLink" target="_blank" title="Visit $FooterLink" style="display:block;border:0;outline:none;text-decoration:none;">
-                <img class="footer-img" src="cid:footer" alt="RealmJoin - Companion to Intune - Application Lifecycle and Management Automation Platform - Visit $FooterLink" width="750" height="200" border="0" style="display:block;width:100%;max-width:750px;height:auto;border:0;outline:none;text-decoration:none;" />
+                <!-- keep src/alt/width of the mso and non-mso img in sync -->
+                <!--[if mso]><img src="cid:footer" alt="$FooterAltText" width="750" border="0" style="width:750px;display:block;border:0;" /><![endif]-->
+                <!--[if !mso]><!--><img class="footer-img" src="cid:footer" alt="$FooterAltText" width="750" border="0" style="display:block;width:100%;max-width:750px;height:auto;border:0;outline:none;text-decoration:none;" /><!--<![endif]-->
             </a>
         </div>
 "@
@@ -1279,7 +1549,7 @@ function Get-RjReportEmailBody {
 "@
 }
 
-function Get-MimeTypeFromExtension {
+function Get-RjRbMimeTypeFromExtension {
     <#
         .SYNOPSIS
         Returns the MIME type for a given file extension.
@@ -1292,11 +1562,11 @@ function Get-MimeTypeFromExtension {
         The file path to determine the MIME type for.
 
         .EXAMPLE
-        PS C:\> Get-MimeTypeFromExtension -FilePath "C:\temp\report.csv"
+        PS C:\> Get-RjRbMimeTypeFromExtension -FilePath "C:\temp\report.csv"
         Returns: text/csv
 
         .EXAMPLE
-        PS C:\> Get-MimeTypeFromExtension -FilePath "C:\temp\data.xlsx"
+        PS C:\> Get-RjRbMimeTypeFromExtension -FilePath "C:\temp\data.xlsx"
         Returns: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 
         .OUTPUTS
@@ -1333,13 +1603,13 @@ function Get-MimeTypeFromExtension {
     }
 }
 
-function Send-RjReportEmail {
+function Send-RjRbReportEmail {
     <#
         .SYNOPSIS
         Sends a RealmJoin-branded HTML email (converted from Markdown) via Microsoft Graph.
 
         .DESCRIPTION
-        Send-RjReportEmail builds an HTML email from Markdown content, inlines a RealmJoin-styled HTML template (including light/dark logos), attaches optional files, and sends the message using the Microsoft Graph API (Invoke-MgGraphRequest).
+        Send-RjRbReportEmail builds an HTML email from Markdown content, inlines a RealmJoin-styled HTML template (including light/dark logos), attaches optional files, and sends the message using the Microsoft Graph API (Invoke-MgGraphRequest).
 
         .PARAMETER EmailFrom
         The sender user id (user principal name or id) used for the Graph /users/{id}/sendMail call.
@@ -1375,7 +1645,7 @@ function Send-RjReportEmail {
         a warning is written and the bundled default header is used instead - the send
         is not aborted.
 
-        Recommended dimensions: 750x200 px PNG (matches the email-container width and
+        Recommended dimensions: 750 px width PNG (matches the email-container width and
         the bundled default). Larger images scale down responsively; significantly
         different aspect ratios may look distorted on narrow viewports.
 
@@ -1388,7 +1658,7 @@ function Send-RjReportEmail {
         you want in the footer must already be baked into the supplied PNG (see
         Tests/Build-FooterAsset.ps1 for how the bundled default is composed).
 
-        Recommended dimensions: 750x200 px PNG (same as -HeaderImage).
+        Recommended dimensions: 750 px width PNG (same as -HeaderImage).
 
         .PARAMETER FooterLink
         Optional URL that overrides the hyperlink wrapping the footer image. Defaults to
@@ -1428,7 +1698,7 @@ function Send-RjReportEmail {
           module to be available in the runbook environment (cmdlets Get-MgContext,
           Connect-MgGraph, Invoke-MgGraphRequest). Declare it explicitly in the consuming
           runbook, e.g.:
-            #Requires -Modules @{ModuleName = "Microsoft.Graph.Authentication"; ModuleVersion = "2.0.0"}
+            #Requires -Modules @{ModuleName = "Microsoft.Graph.Authentication"; ModuleVersion = "2.37.0"}
 
     #>
     param(
@@ -1482,7 +1752,7 @@ function Send-RjReportEmail {
     Write-RjRbLog -Message "Parsed $($emailRecipients.Count) recipient(s) from EmailTo parameter" -Verbose
 
     # Convert Markdown to HTML using helper function
-    $htmlContent = ConvertFrom-MarkdownToHtml -MarkdownText $MarkdownContent
+    $htmlContent = ConvertFrom-RjRbMarkdownToHtml -MarkdownText $MarkdownContent
 
     Write-RjRbLog -Message "Successfully converted Markdown content to HTML" -Verbose
 
@@ -1494,7 +1764,7 @@ function Send-RjReportEmail {
             try {
                 $contentBytes = [IO.File]::ReadAllBytes($file)
                 $content = [Convert]::ToBase64String($contentBytes)
-                $mimeType = Get-MimeTypeFromExtension -FilePath $file
+                $mimeType = Get-RjRbMimeTypeFromExtension -FilePath $file
                 $emailAttachments += @{
                     "@odata.type"  = "#microsoft.graph.fileAttachment"
                     "name"         = (Split-Path $file -Leaf)
@@ -1628,18 +1898,19 @@ function Send-RjReportEmail {
         }
     }
 
-    $htmlBody = Get-RjReportEmailBody `
+    $htmlBody = Get-RjRbReportEmailBody `
         -Subject $Subject `
         -HtmlContent $htmlContent `
         -Attachments $validatedAttachments `
         -TenantDisplayName $TenantDisplayName `
         -ReportVersion $ReportVersion `
+        -IncludeTenantInfo `
         -IncludeHeader:$includeHeader `
         -IncludeFooter:$includeFooter `
         -FooterLink $FooterLink
 
     # --- Ensure a Graph connection is active --------------------------------
-    # Send-RjReportEmail is typically the first/only Graph touchpoint in a
+    # Send-RjRbReportEmail is typically the first/only Graph touchpoint in a
     # runbook, so we lazily establish a connection here if none is active.
     # The probe is intentionally permission-free: we only inspect local auth
     # state (script-scope auth headers / Get-MgContext), no network call.
@@ -1737,3 +2008,8 @@ function Send-RjReportEmail {
         }
     }
 }
+
+# Backwards-compatible alias: the original public name was Send-RjReportEmail.
+# The function was renamed to Send-RjRbReportEmail for naming consistency (RjRb
+# prefix); keep the old name working for existing runbooks.
+New-Alias -Name Send-RjReportEmail -Value Send-RjRbReportEmail
