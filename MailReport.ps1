@@ -67,6 +67,12 @@ function Resolve-RjRbImageSource {
         Send-RjReportEmail to build inline Graph attachments for Header/Footer
         overrides. Accepts a local filesystem path that the caller has already
         resolved (URL handling is intentionally not part of the module).
+
+        .DESCRIPTION
+        The image format is detected from the file signature (magic bytes), not from
+        the file extension - a renamed non-image (e.g. an HTML error page saved as
+        .png) is rejected instead of producing a broken inline attachment.
+        Supported formats: PNG, JPEG, GIF.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -77,17 +83,29 @@ function Resolve-RjRbImageSource {
         throw "Image file not found: $Path"
     }
 
-    $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
-    $contentType = switch ($extension) {
-        '.png' { 'image/png' }
-        '.jpg' { 'image/jpeg' }
-        '.jpeg' { 'image/jpeg' }
-        '.gif' { 'image/gif' }
-        default { throw "Unsupported image type '$extension' for $Path. Use PNG, JPG or GIF." }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+
+    # Detect the actual image format from the file signature; the extension may lie.
+    $contentType = $null
+    if ($bytes.Length -ge 8 -and
+        $bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50 -and $bytes[2] -eq 0x4E -and $bytes[3] -eq 0x47 -and
+        $bytes[4] -eq 0x0D -and $bytes[5] -eq 0x0A -and $bytes[6] -eq 0x1A -and $bytes[7] -eq 0x0A) {
+        $contentType = 'image/png'
+    }
+    elseif ($bytes.Length -ge 3 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xD8 -and $bytes[2] -eq 0xFF) {
+        $contentType = 'image/jpeg'
+    }
+    elseif ($bytes.Length -ge 6 -and $bytes[0] -eq 0x47 -and $bytes[1] -eq 0x49 -and $bytes[2] -eq 0x46 -and $bytes[3] -eq 0x38 -and
+        ($bytes[4] -eq 0x37 -or $bytes[4] -eq 0x39) -and $bytes[5] -eq 0x61) {
+        $contentType = 'image/gif'
+    }
+
+    if (-not $contentType) {
+        throw "The file '$Path' is not a PNG, JPEG or GIF image (unrecognized file signature). Use PNG, JPG or GIF."
     }
 
     [pscustomobject]@{
-        Bytes       = [IO.File]::ReadAllBytes($Path)
+        Bytes       = $bytes
         ContentType = $contentType
         FileName    = [IO.Path]::GetFileName($Path)
     }
@@ -103,26 +121,77 @@ function Add-RjRbCellSoftBreaks {
         The Outlook Classic (Word) engine does not break long words inside
         table cells; a single unbreakable token wider than its column makes
         Word grow the whole table - and with it the fixed 750px email card -
-        past the header/footer banners. This helper inserts U+200B zero-width
-        spaces every 10 characters into runs of 30+ characters that contain no
-        natural break points (. @ / - &). Word and modern clients treat U+200B
-        as an invisible line-break opportunity. Only text nodes are touched -
-        never markup, attributes or URLs. Trade-off: copying such a
-        (pathological) value out of the mail includes the invisible U+200B
-        characters; realistic serials, device names, mail addresses and URLs
-        stay untouched because they are either shorter than 30 characters or
-        wrap naturally at their punctuation.
+        past the header/footer banners, which is what leaves a strip beside
+        the banner graphic.
+
+        MEASURED (Word 16.x, via an OOXML round-trip of the generated markup):
+        Word offers a line-break opportunity ONLY at whitespace, U+002D
+        hyphen-minus, U+00AD soft hyphen and U+200B zero-width space. '.', '@',
+        '/', ':', '&' and '\' are NOT break opportunities - a 95-character
+        registry path measured 664px of minimum width against a 654px column,
+        with or without the surrounding <code> element - so the earlier
+        exemption of tokens containing them was exactly backwards, and
+        'Henrietta.Mueller@fabrikam.com' reached Word as one unbreakable
+        30-character run measuring ~236px against the 144px its column was
+        allotted. That single token widened the card by ~16px.
+
+        This helper splits every text-node token longer than -MaxRunChars into
+        -MaxRunChars sized pieces joined by U+200B. Callers pass the run length
+        the target column can actually hold, so the number of inserted breaks
+        is the minimum needed. HTML entities are counted and kept as single
+        units, so '&amp;' is never split apart, and internal placeholders
+        (§...§) are left alone so they still resolve later. Only text nodes are
+        touched - never tags, attributes or href values.
+
+        Only Outlook Classic needs the breaks, and only Outlook Classic should
+        pay for them: with -ConditionalTwin each affected run is emitted twice,
+        the broken copy behind <!--[if mso]> and the original behind the
+        downlevel-revealed twin. Every other client therefore keeps a value that
+        pastes cleanly, and the duplication is per RUN, not per element - it only
+        fires on runs past the limit, which are rare by construction.
+
+        .PARAMETER MaxRunChars
+        Longest run left untouched. Callers pass the run length their container
+        can actually hold.
+
+        .PARAMETER ConditionalTwin
+        Emit an MSO-only twin per broken run instead of breaking the text for
+        every client. A caller whose output is ALREADY inside an [if mso] block
+        must leave this off - HTML comments do not nest, so a conditional comment
+        inside a conditional comment terminates the outer one early and leaks the
+        MSO-only markup to everyone.
+
+        Trade-off: without -ConditionalTwin, copying an affected value out of the
+        mail carries the invisible U+200B characters along.
     #>
-    param([string]$Html)
+    param(
+        [string]$Html,
+        [int]$MaxRunChars = 80,
+        [switch]$ConditionalTwin
+    )
     if ([string]::IsNullOrEmpty($Html)) { return $Html }
+    if ($MaxRunChars -lt 6) { $MaxRunChars = 6 }
+    $zwsp = [string][char]0x200B
+    # A width "character" is a whole HTML entity or a single character.
+    $unitPattern = '&(?:[A-Za-z][A-Za-z0-9]{1,9}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});|[\s\S]'
+    $twin = $ConditionalTwin.IsPresent
     return [regex]::Replace($Html, '(?<=^|>)[^<>]+(?=<|$)', {
         param($m)
-        [regex]::Replace($m.Value, '[^\s<>&.@/\-]{30,}', {
+        # Token = a run with no break opportunity Word would honour.
+        [regex]::Replace($m.Value, '[^\s\u00AD\u200B-]+', {
             param($t)
-            # 10-char chunks (~70px at 14px font) fit even the narrowest
-            # generated column, so Word never needs to grow the table
-            $chunks = [regex]::Matches($t.Value, '.{1,10}') | ForEach-Object { $_.Value }
-            [string]::Join([string][char]0x200B, $chunks)
+            # Never touch the converter's own placeholders - a U+200B inside
+            # §INLINECODE§n§ would stop it resolving back to its code span.
+            if ($t.Value.Contains([char]0xA7)) { return $t.Value }
+            $units = [regex]::Matches($t.Value, $unitPattern)
+            if ($units.Count -le $MaxRunChars) { return $t.Value }
+            $sb = [System.Text.StringBuilder]::new()
+            for ($u = 0; $u -lt $units.Count; $u++) {
+                if ($u -gt 0 -and ($u % $MaxRunChars) -eq 0) { [void]$sb.Append($zwsp) }
+                [void]$sb.Append($units[$u].Value)
+            }
+            if (-not $twin) { return $sb.ToString() }
+            return "<!--[if mso]>$($sb.ToString())<![endif]--><!--[if !mso]><!-->$($t.Value)<!--<![endif]-->"
         })
     })
 }
@@ -139,6 +208,15 @@ function ConvertFrom-RjRbMarkdownToHtml {
         .PARAMETER MarkdownText
         The Markdown text to convert to HTML.
 
+        .PARAMETER AccentColor
+        Accent color (hex, e.g. '#f8842c') used for table headers and link buttons.
+        Defaults to the RealmJoin orange. The value is used verbatim in inline styles -
+        callers are expected to validate it (Send-RjRbReportEmail does).
+
+        .PARAMETER TextColor
+        Primary text color (hex, e.g. '#011e33') used for list items and code text.
+        Defaults to the RealmJoin navy.
+
         .EXAMPLE
         PS C:\> ConvertFrom-RjRbMarkdownToHtml -MarkdownText "# Hello World`n`nThis is **bold** text."
 
@@ -148,7 +226,11 @@ function ConvertFrom-RjRbMarkdownToHtml {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
-        [string]$MarkdownText
+        [string]$MarkdownText,
+
+        [string]$AccentColor = '#f8842c',
+
+        [string]$TextColor = '#011e33'
     )
 
     # Input validation
@@ -163,11 +245,24 @@ function ConvertFrom-RjRbMarkdownToHtml {
     $html = $html -replace "`r`n", "`n"
     $html = $html -replace "`r", "`n"
 
-    # Escape Markdown characters first
-    $html = $html -replace '\\(.)', '§ESCAPED§$1§ESCAPED§'
-    # Escaped pipes still contain '|' which breaks table-column splitting;
-    # replace with a fully opaque placeholder before table processing.
-    $html = $html -replace '§ESCAPED§\|§ESCAPED§', '§ESCAPEDPIPE§'
+    # Escape Markdown characters first.
+    #
+    # ASCII punctuation ONLY, per CommonMark: a backslash before anything else is
+    # a literal backslash, not an escape. The previous '\\(.)' swallowed the
+    # backslashes of Windows paths and registry keys - 'HKLM:\SOFTWARE\Policies'
+    # arrived as 'HKLM:SOFTWAREPolicies', which for a runbook report is both wrong
+    # and, with every break opportunity gone, a token Word cannot wrap.
+    #
+    # The character is encoded as its code point, NOT wrapped in markers. The old
+    # form '§ESCAPED§*§ESCAPED§' left the '*' in plain sight, so the emphasis pass
+    # further down matched it anyway and produced
+    # '§ESCAPED§<em>§ESCAPED§not italic§ESCAPED§</em>§ESCAPED§' - the escape did
+    # not escape, and the markers leaked into the mail. Numeric encoding hides the
+    # character from every later pattern, which is the whole point of the pass.
+    $html = [regex]::Replace($html, '\\([!-/:-@\[-`{-~])', {
+        param($m)
+        '§ESCAPED§{0}§' -f [int][char]$m.Groups[1].Value
+    })
 
     # Extract and protect code blocks before processing other markdown elements
     # This prevents headers and other markdown syntax inside code blocks from being transformed
@@ -185,19 +280,30 @@ function ConvertFrom-RjRbMarkdownToHtml {
 
         $preStyle = "background-color:#e8ebed;padding:20px;border-radius:8px;border:1px solid #e5e7eb;font-family:'SF Mono',Monaco,'Consolas',monospace;margin:20px 0;overflow-x:auto;"
         $preTag = if ($language) {
-            "<pre bgcolor=`"#e8ebed`" style=`"$preStyle`"><code class=`"language-$language`" style=`"background:none;border:none;padding:0;font-family:inherit;font-size:inherit;color:#011e33;`">$code</code></pre>"
+            "<pre bgcolor=`"#e8ebed`" style=`"$preStyle`"><code class=`"language-$language`" style=`"background:none;border:none;padding:0;font-family:inherit;font-size:inherit;color:$TextColor;`">$code</code></pre>"
         }
         else {
-            "<pre bgcolor=`"#e8ebed`" style=`"$preStyle`"><code style=`"background:none;border:none;padding:0;font-family:inherit;font-size:inherit;color:#011e33;`">$code</code></pre>"
+            "<pre bgcolor=`"#e8ebed`" style=`"$preStyle`"><code style=`"background:none;border:none;padding:0;font-family:inherit;font-size:inherit;color:$TextColor;`">$code</code></pre>"
         }
 
         # Wrap in MSO-only table to add horizontal inset in Outlook Classic
         # (Word engine ignores border-radius, so without this the bg fills edge-to-edge)
         # Use <pre> inside the td to preserve line breaks in Outlook Classic.
-        # table-layout:fixed pins the table to the container width (Word's automatic
-        # layout would grow it to fit the longest code line); white-space:pre-wrap asks
-        # Word to wrap long lines instead of clipping them at the fixed cell edge.
-        $htmlBlock = "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"margin:20px 0;width:100%;table-layout:fixed;border-collapse:collapse;`"><tr><td bgcolor=`"#e8ebed`" style=`"background-color:#e8ebed;border:1px solid #e5e7eb;padding:20px;`"><pre style=`"margin:0;font-family:Consolas,'Courier New',monospace;font-size:13px;color:#011e33;white-space:pre-wrap;`">$code</pre></td></tr></table><![endif]--><!--[if !mso]><!-->$preTag<!--<![endif]-->"
+        #
+        # MEASURED: white-space:pre-wrap DOES work in Word - a 187-character command
+        # line wraps at its spaces and the card stays at 750px. Only a run with no
+        # break opportunity at all overflows: a 166-character URL measured the card
+        # at 992.85px, i.e. 243px past the card, far more than the 96px the content
+        # row's gutter columns can absorb. So only such runs are soft-broken, and
+        # only in the MSO twin - the <pre> that modern clients get is a separate
+        # string and stays byte-for-byte copy-pasteable.
+        # 70 chars x ~7.15px (13px Consolas) = 500px, inside the 614px this cell
+        # has after its 2x20px padding. 80 measured exactly 654px - on budget with
+        # zero margin, and Windows metrics run wider than the Mac measurement, so
+        # the threshold keeps a reserve. Ordinary code is untouched: the longest
+        # token in a realistic pipeline is ~35 characters.
+        $msoCode = Add-RjRbCellSoftBreaks -Html $code -MaxRunChars 70
+        $htmlBlock = "<!--[if mso]><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"margin:20px 0;width:100%;table-layout:fixed;border-collapse:collapse;`"><tr><td bgcolor=`"#e8ebed`" style=`"background-color:#e8ebed;border:1px solid #e5e7eb;padding:20px;`"><pre style=`"margin:0;font-family:Consolas,'Courier New',monospace;font-size:13px;color:$TextColor;white-space:pre-wrap;`">$msoCode</pre></td></tr></table><![endif]--><!--[if !mso]><!-->$preTag<!--<![endif]-->"
 
         $placeholder = "§CODEBLOCK§$codeBlockIndex§"
         $codeBlocks += $htmlBlock
@@ -246,11 +352,11 @@ function ConvertFrom-RjRbMarkdownToHtml {
             elseif ($i -eq 0) { 'padding:0 6px 0 0;' }
             elseif ($i -eq ($count - 1)) { 'padding:0 0 0 6px;' }
             else { 'padding:0 6px;' }
-            $msoCells.Add("<td width=`"$cellPercent%`" valign=`"top`" style=`"${msoPad}border:none;background:none;`"><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"width:100%;table-layout:fixed;$tableReset`"><tr><td bgcolor=`"#f8842c`" align=`"center`" valign=`"middle`" style=`"mso-padding-alt:14px 8px;padding:14px 8px;border:none;`"><a href=`"$href`" style=`"font-family:'Segoe UI',Arial,sans-serif;font-size:16px;font-weight:bold;line-height:16px;color:#ffffff;text-decoration:none;mso-line-height-rule:exactly;`">$label</a></td></tr></table></td>")
+            $msoCells.Add("<td width=`"$cellPercent%`" valign=`"top`" style=`"${msoPad}border:none;background:none;`"><table role=`"presentation`" width=`"100%`" cellpadding=`"0`" cellspacing=`"0`" border=`"0`" style=`"width:100%;table-layout:fixed;$tableReset`"><tr><td bgcolor=`"$AccentColor`" align=`"center`" valign=`"middle`" style=`"mso-padding-alt:14px 8px;padding:14px 8px;border:none;`"><a href=`"$href`" style=`"font-family:'Segoe UI',Arial,sans-serif;font-size:16px;font-weight:bold;line-height:16px;color:#ffffff;text-decoration:none;mso-line-height-rule:exactly;`">$label</a></td></tr></table></td>")
 
             # Modern clients support flexible button widths and rounded corners. 
             # Render buttons as links with padding and background color, wrapped in a flex container to allow wrapping if there are many buttons or the labels are long.
-            $webButtons.Add("<a href=`"$href`" target=`"_blank`" rel=`"noopener noreferrer`" style=`"flex:1 1 200px;box-sizing:border-box;margin:6px;background-color:#f8842c;border-radius:8px;color:#ffffff;font-family:'Miriam Libre','Segoe UI',Arial,sans-serif;font-size:16px;font-weight:700;line-height:1;text-align:center;text-decoration:none;padding:14px 8px;`">$label</a>")
+            $webButtons.Add("<a href=`"$href`" target=`"_blank`" rel=`"noopener noreferrer`" style=`"flex:1 1 200px;box-sizing:border-box;margin:6px;background-color:$AccentColor;border-radius:8px;color:#ffffff;font-family:'Miriam Libre','Segoe UI',Arial,sans-serif;font-size:16px;font-weight:700;line-height:1;text-align:center;text-decoration:none;padding:14px 8px;`">$label</a>")
         }
 
         # Outlook Classic (Word engine) requires tables for complex layouts, so render buttons in a table row with one cell per button.
@@ -466,20 +572,44 @@ function ConvertFrom-RjRbMarkdownToHtml {
                         # now), count entities and escaped pipes as one character.
                         $visible = $laCells[$lc].Trim()
                         $visible = $visible -replace '§INLINECODE§(\d+)§', { 'x' * (($inlineCodeBlocks[[int]$_.Groups[1].Value] -replace '<[^>]+>', '').Length) }
-                        $visible = $visible -replace '<[^>]+>', '' -replace '§ESCAPEDPIPE§|&[A-Za-z]+;|&#\d+;', 'x' -replace '§ESCAPED§', ''
+                        # An escape placeholder and an entity each stand for ONE
+                        # rendered character - count them as such, or the column
+                        # allocator over-estimates and steals width from its
+                        # neighbours.
+                        $visible = $visible -replace '<[^>]+>', '' -replace '§ESCAPED§\d+§|&[A-Za-z]+;|&#\d+;', 'x'
                         while ($colMaxChars.Count -le $lc) { $colMaxChars.Add(0) }
                         if ($visible.Length -gt $colMaxChars[$lc]) { $colMaxChars[$lc] = $visible.Length }
                     }
                 }
                 $tableColPcts = @()
+                $tableColRunChars = @()
                 $tableColPctsPending = $false
+
+                # Horizontal cell padding scales DOWN with the column count.
+                # Padding is per column, so it eats the width budget linearly:
+                # at the default 2x16px a nine-column table spends 288px of the
+                # 654px content width - 44% - on padding alone, before a single
+                # character is rendered. MEASURED on the nine-column stress
+                # fixture: min-content 670px against a 654px budget, i.e. 16px
+                # over, which is exactly the strip that reappeared beside the
+                # banner. Soft-breaking cannot recover it - those columns are
+                # already at the 6-character floor - so the padding is what has
+                # to give. 2x6px brings the same table to ~518px.
+                # Every consumer of this number must use THIS variable: the
+                # allocator below, the run-length budget, and the emitted <th>
+                # and <td> styles. If they drift apart, the allocator promises
+                # widths the cells do not have.
+                $tableCellPadX = if ($colMaxChars.Count -ge 9) { 6 }
+                elseif ($colMaxChars.Count -ge 7) { 8 }
+                else { 16 }
+
                 if ($colMaxChars.Count -ge 2) {
                     # Pixel need per column: clamped char count x ~7px (14px
                     # proportional font) plus the 2x16px cell padding. Distribute the
                     # ~650px content width max-min fair: every column that fits keeps
                     # exactly its need (dates never wrap), oversized columns split the
                     # remainder equally among themselves.
-                    $colPxNeed = @($colMaxChars | ForEach-Object { [Math]::Min([Math]::Max($_, 3), 60) * 7 + 32 })
+                    $colPxNeed = @($colMaxChars | ForEach-Object { [Math]::Min([Math]::Max($_, 3), 60) * 7 + 2 * $tableCellPadX })
                     $colPx = @(0.0) * $colPxNeed.Count
                     $avail = 650.0
                     $active = @(0..($colPxNeed.Count - 1))
@@ -517,6 +647,18 @@ function ConvertFrom-RjRbMarkdownToHtml {
                         $pct[$ci]++; $rest--
                     }
                     $tableColPcts = $pct
+                    # Longest unbreakable run each column can hold without forcing Word
+                    # to widen the table: (allocated px - cell padding) / px per char.
+                    # 7.6px/char is what Windows Segoe UI MEASURES at 14px for the
+                    # digit- and caps-heavy content of a device report; the allocator
+                    # above deliberately keeps its own 7px estimate, because that one
+                    # only distributes width proportionally and changing it would move
+                    # every column percentage. Here the number decides whether a token
+                    # fits, so it has to be the pessimistic one - Word for Mac
+                    # substitutes a narrower font and would otherwise sign off on
+                    # layouts that overflow on Windows.
+                    # Floor of 6 keeps pathologically narrow columns sane.
+                    $tableColRunChars = @($colPx | ForEach-Object { [Math]::Max(6, [Math]::Floor(($_ - 2 * $tableCellPadX) / 7.6)) })
                     $tableColPctsPending = $true
                 }
 
@@ -536,15 +678,16 @@ function ConvertFrom-RjRbMarkdownToHtml {
                     # Process header row
                     $cells = ($line -replace '^\|', '' -replace '\|$', '').Split('|')
                     if ($cells.Count -gt 0) {
-                        $processedLines += '<thead><tr bgcolor="#f8842c" style="background-color:#f8842c;">'
+                        $processedLines += "<thead><tr bgcolor=`"$AccentColor`" style=`"background-color:$AccentColor;`">"
                         for ($j = 0; $j -lt $cells.Count; $j++) {
-                            $cleanCell = Add-RjRbCellSoftBreaks -Html $cells[$j].Trim()
+                            $cellRunChars = if ($j -lt $tableColRunChars.Count) { $tableColRunChars[$j] } else { 80 }
+                            $cleanCell = Add-RjRbCellSoftBreaks -Html $cells[$j].Trim() -MaxRunChars $cellRunChars -ConditionalTwin
                             if ([string]::IsNullOrWhiteSpace($cleanCell)) { $cleanCell = '&nbsp;' }
                             $alignClass = if ($j -lt $tableAlignments.Count -and $tableAlignments[$j]) { " class=`"text-$($tableAlignments[$j])`"" } else { "" }
                             # width:N% first in the style attr - the header row defines
                             # Word's column grid (see width computation comment above)
                             $widthStyle = if ($tableColPctsPending -and $j -lt $tableColPcts.Count) { "width:$($tableColPcts[$j])%;" } else { '' }
-                            $processedLines += "<th$alignClass style=`"${widthStyle}background-color:#f8842c;color:#ffffff;padding:8px 16px;font-weight:600;font-size:14px;`">$cleanCell</th>"
+                            $processedLines += "<th$alignClass style=`"${widthStyle}background-color:$AccentColor;color:#ffffff;padding:8px ${tableCellPadX}px;font-weight:600;font-size:14px;`">$cleanCell</th>"
                         }
                         $processedLines += '</tr></thead><tbody>'
                         $tableColPctsPending = $false
@@ -561,14 +704,15 @@ function ConvertFrom-RjRbMarkdownToHtml {
                 $rowBgAttr = if ($tableRowIndex % 2 -eq 0) { ' bgcolor="#e8ebed" style="background-color:#e8ebed;"' } else { '' }
                 $processedLines += "<tr$rowBgAttr>"
                 for ($j = 0; $j -lt $cells.Count; $j++) {
-                    $cleanCell = Add-RjRbCellSoftBreaks -Html $cells[$j].Trim()
+                    $cellRunChars = if ($j -lt $tableColRunChars.Count) { $tableColRunChars[$j] } else { 80 }
+                    $cleanCell = Add-RjRbCellSoftBreaks -Html $cells[$j].Trim() -MaxRunChars $cellRunChars -ConditionalTwin
                     if ([string]::IsNullOrWhiteSpace($cleanCell)) { $cleanCell = '&nbsp;' }
                     $alignStyle = if ($j -lt $tableAlignments.Count -and $tableAlignments[$j]) { "text-align:$($tableAlignments[$j]);" } else { "" }
                     $alignClass = if ($j -lt $tableAlignments.Count -and $tableAlignments[$j]) { " class=`"text-$($tableAlignments[$j])`"" } else { "" }
                     # Only set for the first row of a headerless table (no separator
                     # line): that row then defines Word's column grid instead of a thead
                     $widthStyle = if ($tableColPctsPending -and $j -lt $tableColPcts.Count) { "width:$($tableColPcts[$j])%;" } else { '' }
-                    $processedLines += "<td$alignClass style=`"${widthStyle}padding:8px 16px;border-bottom:1px solid #e8ebed;font-size:14px;color:#2D3748;${alignStyle}`">$cleanCell</td>"
+                    $processedLines += "<td$alignClass style=`"${widthStyle}padding:8px ${tableCellPadX}px;border-bottom:1px solid #e8ebed;font-size:14px;color:#2D3748;${alignStyle}`">$cleanCell</td>"
                 }
                 $processedLines += '</tr>'
                 $tableColPctsPending = $false
@@ -625,7 +769,7 @@ function ConvertFrom-RjRbMarkdownToHtml {
                 # which inflates the row height noticeably.
                 $glyph = if ($taskChecked) { '&#9745;' } else { '&#9744;' }
                 $glyphColor = if ($taskChecked) { '#10b981' } else { '#6b7280' }
-                $processedLines += "<tr><td valign=`"top`" style=`"padding:2px 8px 2px 0;border:0;background:transparent;color:$glyphColor;font-weight:700;line-height:1.5;font-size:16px;`"><p style=`"margin:0;padding:0;`">$glyph</p></td><td valign=`"top`" style=`"padding:2px 0;border:0;background:transparent;line-height:1.5;color:#011e33;font-size:16px;`"><p style=`"margin:0;padding:0;`">$content</p></td></tr>"
+                $processedLines += "<tr><td valign=`"top`" style=`"padding:2px 8px 2px 0;border:0;background:transparent;color:$glyphColor;font-weight:700;line-height:1.5;font-size:16px;`"><p style=`"margin:0;padding:0;`">$glyph</p></td><td valign=`"top`" style=`"padding:2px 0;border:0;background:transparent;line-height:1.5;color:$TextColor;font-size:16px;`"><p style=`"margin:0;padding:0;`">$content</p></td></tr>"
                 $lastListItemIndex = $processedLines.Count - 1
                 continue
             }
@@ -648,7 +792,7 @@ function ConvertFrom-RjRbMarkdownToHtml {
                 Update-ListNesting -TargetLevel $targetLevel -ListStack ([ref]$listStack) -ProcessedLines ([ref]$processedLines) -ListType 'ul'
             }
 
-            $processedLines += "<li style=`"margin:4px 0;padding-left:8px;line-height:1.5;color:#011e33;`">$content</li>"
+            $processedLines += "<li style=`"margin:4px 0;padding-left:8px;line-height:1.5;color:$TextColor;`">$content</li>"
             $lastListItemIndex = $processedLines.Count - 1
         }
         # Ordered List processing
@@ -679,7 +823,7 @@ function ConvertFrom-RjRbMarkdownToHtml {
                 Update-ListNesting -TargetLevel $targetLevel -ListStack ([ref]$listStack) -ProcessedLines ([ref]$processedLines) -ListType 'ol'
             }
 
-            $processedLines += "<li style=`"margin:4px 0;padding-left:8px;line-height:1.5;color:#011e33;`">$content</li>"
+            $processedLines += "<li style=`"margin:4px 0;padding-left:8px;line-height:1.5;color:$TextColor;`">$content</li>"
             $lastListItemIndex = $processedLines.Count - 1
         }
         # Other lines
@@ -787,25 +931,84 @@ function ConvertFrom-RjRbMarkdownToHtml {
     # Final safety escaping
     $html = $html -replace '&(?![a-zA-Z]{2,8};)(?!#[0-9]{1,7};)(?!#x[0-9a-fA-F]{1,6};)', '&amp;'
 
-    # Restore escaped Markdown characters
-    $html = $html -replace '§ESCAPEDPIPE§', '|'
-    $html = $html -replace '§ESCAPED§(.{1})§ESCAPED§', '$1'
+    # Restore escaped Markdown characters. Outside code the backslash was markup
+    # and is dropped; '\*' renders as a literal '*'.
+    $html = [regex]::Replace($html, '§ESCAPED§(\d+)§', {
+        param($m)
+        [string][char][int]$m.Groups[1].Value
+    })
 
     # Restore protected blocks from placeholders. String.Replace, NOT -replace:
     # the stored fragments are user content, and regex substitution would treat
     # $-sequences in them as substitution tokens ($_ = whole input, $& = match,
     # $1 = group), duplicating the entire document or corrupting the output.
+    #
+    # Escapes are resolved INSIDE each fragment as well. Escaping runs before the
+    # code spans and blocks are lifted out, so their content still carries
+    # §ESCAPED§ markers at this point, while the restore pass above only ever saw
+    # $html - which no longer contains them. Anything escaped inside backticks
+    # therefore used to reach the reader verbatim, e.g.
+    # 'HKLM:§ESCAPED§S§ESCAPED§OFTWARE'.
+    # Inside code the backslash is content, not markup (CommonMark does not
+    # process escapes in code spans), so it is put back - except for '|', which
+    # GFM does treat as escapable inside a table cell even within code.
+    $restoreEscapes = {
+        param([string]$Fragment)
+        return [regex]::Replace($Fragment, '§ESCAPED§(\d+)§', {
+            param($m)
+            $ch = [char][int]$m.Groups[1].Value
+            if ($ch -eq '|') { return '|' }
+            return '\' + $ch
+        })
+    }
+
     for ($i = 0; $i -lt $inlineCodeBlocks.Count; $i++) {
-        $html = $html.Replace("§INLINECODE§$i§", $inlineCodeBlocks[$i])
+        $html = $html.Replace("§INLINECODE§$i§", (& $restoreEscapes $inlineCodeBlocks[$i]))
     }
 
     for ($i = 0; $i -lt $codeBlocks.Count; $i++) {
-        $html = $html.Replace("§CODEBLOCK§$i§", $codeBlocks[$i])
+        $html = $html.Replace("§CODEBLOCK§$i§", (& $restoreEscapes $codeBlocks[$i]))
     }
 
     for ($i = 0; $i -lt $buttonRows.Count; $i++) {
         $html = $html.Replace("§BUTTONROW§$i§", $buttonRows[$i])
     }
+
+    # Final width safety net for everything OUTSIDE data tables and code blocks:
+    # prose, list and task-list items, blockquotes, admonitions and inline code.
+    # Those have no column budget, and a long run there widens the Outlook Classic
+    # card just as a table cell would - MEASURED per construct against the 654px
+    # content column: a 95-character registry path in inline code needs 670px, the
+    # same path in a blockquote 660px. Both drop to exactly 654px once the run can
+    # break. 60 characters is the bound: inline code MEASURES ~8.2px per
+    # character, so 80 still left the column 3px over at 657px; 60 gives ~508px
+    # including the code span's own padding, and 462px for 14px body text.
+    #
+    # Only Outlook Classic gets the breaks (-ConditionalTwin), so a value copied
+    # out of any other client is unchanged.
+    #
+    # Two kinds of region are skipped:
+    #   <pre>            - the code-block MSO twin is bounded by its own call at
+    #                      70, and the copy modern clients get has to stay
+    #                      byte-for-byte pasteable.
+    #   [if ...] blocks  - conditional comments do not nest. Table cells were
+    #                      already twinned above, so running over them again
+    #                      would put a conditional inside a conditional, which
+    #                      terminates the outer one early and leaks MSO-only
+    #                      markup into every client. The cost of skipping them is
+    #                      that text living ONLY inside such a block - button
+    #                      labels are the one real case - stays unbounded.
+    #
+    # Ordinary prose never reaches 60 characters without a break opportunity, so
+    # this only ever fires on paths, URLs, hashes and identifiers - exactly the
+    # runs that would otherwise widen the card.
+    $guarded = [regex]::Split($html, '(?s)(<pre[^>]*>.*?</pre>|<!--\[if [^\]]*\]>.*?<!\[endif\]-->)')
+    for ($p = 0; $p -lt $guarded.Count; $p++) {
+        if ($guarded[$p] -notmatch '^(<pre|<!--\[if )') {
+            $guarded[$p] = Add-RjRbCellSoftBreaks -Html $guarded[$p] -MaxRunChars 60 -ConditionalTwin
+        }
+    }
+    $html = -join $guarded
 
     return $html
 }
@@ -858,6 +1061,18 @@ function Get-RjRbReportEmailBody {
         Optional alt text for the footer image. Defaults to
         'RealmJoin - Companion to Intune - Application Lifecycle and Management Automation Platform'. The supplied value is used verbatim as the alt attribute of the footer image.
 
+        .PARAMETER AccentColor
+        Accent color (hex) used for table headers, buttons, accent borders and the
+        horizontal rule. Defaults to the RealmJoin orange '#f8842c' - with the default,
+        the generated HTML is identical to previous module versions. The value is used
+        verbatim in the CSS/inline styles; callers are expected to validate it
+        (Send-RjRbReportEmail does).
+
+        .PARAMETER TextColor
+        Primary text color (hex) used for body text, headings and code. Defaults to
+        the RealmJoin navy '#011e33' - with the default, the generated HTML is
+        identical to previous module versions.
+
         .OUTPUTS
         System.String. Returns the composed HTML email body.
     #>
@@ -885,16 +1100,60 @@ function Get-RjRbReportEmailBody {
 
         [string]$FooterLink = 'https://www.realmjoin.com',
 
-        [string]$FooterAltText = 'RealmJoin - Companion to Intune - Application Lifecycle and Management Automation Platform - Visit https://www.realmjoin.com'
+        [string]$FooterAltText = 'RealmJoin - Companion to Intune - Application Lifecycle and Management Automation Platform - Visit https://www.realmjoin.com',
+
+        [string]$AccentColor = '#f8842c',
+
+        [string]$TextColor = '#011e33'
     )
 
     if ([string]::IsNullOrEmpty($HtmlContent) -and -not [string]::IsNullOrEmpty($MarkdownText)) {
-        $HtmlContent = ConvertFrom-RjRbMarkdownToHtml -MarkdownText $MarkdownText
+        $HtmlContent = ConvertFrom-RjRbMarkdownToHtml -MarkdownText $MarkdownText -AccentColor $AccentColor -TextColor $TextColor
     }
 
     if (-not $Attachments) {
         $Attachments = @()
     }
+
+    # === MSO CARD GEOMETRY =====================================================
+    # For Outlook Classic the card is an outer 750px table holding ONE cell, and
+    # inside it each section (header banner / content / footer banner) is its own
+    # nested 750px table.
+    #
+    # Why the banners get their own tables: the Word engine does not implement
+    # table-layout at all (measured). A table's rendered grid is max(declared
+    # width, min-content width), and every row of one table shares ONE column
+    # grid. So while a banner image sat in the same table as the content, content
+    # too wide for the 654px budget widened the banner's cell too, while the image
+    # stayed pinned at its 750px width attribute - and that difference is the
+    # strip beside the banner. Measured with identical content: shared grid ->
+    # banner cell 767.20px against a 749.33px image; own table -> 750.00px flat.
+    #
+    # Why the outer table is still needed: Word imports the content table as
+    # AUTOFIT-TO-WINDOW, not as a fixed width - measured via the Word object
+    # model, the banner tables come in as "preferred width points" 562.5pt while
+    # the content table comes in as "preferred width percent" with Word's 9999999
+    # autofit sentinel, whatever px width the markup declares. Left as a top-level
+    # table it therefore stretches to the full Outlook reading pane. Nesting it in
+    # a fixed 750px cell bounds that autofit; an inner width:100% wrapper does NOT
+    # (measured, identical autofit result).
+    #
+    # Each nested table stays inside its existing div (.header / .content /
+    # .footer) so no two tables are adjacent siblings - Word merges directly
+    # adjacent tables back into one grid, which would reinstate the coupling.
+    #
+    # The content table's 48px side margins are gutter COLUMNS, not cell padding.
+    # Word cannot redistribute padding, so content that overflows its column
+    # pushes the whole table wider; it CAN take width out of a gutter column.
+    # Measured with identical overflowing content: padding -> 767.20px grid,
+    # gutter columns -> 750.33px with the right gutter shaved to 32px. That turns
+    # a broken card edge into a slightly narrower gutter and absorbs up to 96px
+    # of overflow. NOTE: this rationale lives here as a PowerShell comment on
+    # purpose - an HTML comment inside a <!--[if mso]> block terminates the
+    # conditional early (HTML comments do not nest), which leaks the MSO-only
+    # markup into every other client.
+    $msoGutterCell = '<td width="48" style="width:48px;font-size:1px;line-height:1px;" valign="top">&nbsp;</td>'
+    $msoSectionTableOpen = '<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="750" style="width:750px;border-collapse:collapse;">'
 
     return @"
 <!DOCTYPE html>
@@ -917,7 +1176,7 @@ function Get-RjRbReportEmailBody {
     body {
         font-family: 'Miriam Libre', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
         line-height: 1.6;
-        color: #011e33;
+        color: $TextColor;
         background-color: #e8ebed;
         padding: 20px;
     }
@@ -957,7 +1216,7 @@ function Get-RjRbReportEmailBody {
     .tenant-info {
         background: #e8ebed;
         border: 1px solid #e0e7ff;
-        border-left: 4px solid #f8842c;
+        border-left: 4px solid $AccentColor;
         padding: 10px 20px;
         margin-top: 32px;
         border-radius: 8px;
@@ -965,7 +1224,7 @@ function Get-RjRbReportEmailBody {
     }
 
     .tenant-info strong {
-        color: #011e33;
+        color: $TextColor;
         font-weight: 600;
     }
 
@@ -1033,7 +1292,7 @@ function Get-RjRbReportEmailBody {
     .content li {
         margin-top: 4px;
         margin-left: 0;
-        color: #011e33;
+        color: $TextColor;
         line-height: 1.5;
         margin-bottom: 4px;
         padding-left: 8px;
@@ -1057,7 +1316,7 @@ function Get-RjRbReportEmailBody {
     }
 
     .content th {
-        background: #f8842c !important;
+        background: $AccentColor !important;
         color: #ffffff !important;
         padding: 8px 16px;
         text-align: left;
@@ -1104,7 +1363,7 @@ function Get-RjRbReportEmailBody {
         border-radius: 4px;
         font-family: 'SF Mono', Monaco, 'Consolas', monospace;
         font-size: 0.875em;
-        color: #011e33;
+        color: $TextColor;
         border: 1px solid #e5e7eb;
     }
 
@@ -1150,14 +1409,14 @@ function Get-RjRbReportEmailBody {
     .attachments {
         background: #e8ebed;
         border: 1px solid #e0e7ff;
-        border-left: 4px solid #f8842c;
+        border-left: 4px solid $AccentColor;
         border-radius: 8px;
         padding: 10px 20px;
         margin-top: 10px;
     }
 
     .attachments h3 {
-        color: #011e33;
+        color: $TextColor;
         margin-top: 0;
         font-size: 14px;
         font-weight: 600;
@@ -1294,7 +1553,7 @@ function Get-RjRbReportEmailBody {
         .tenant-info {
             background: linear-gradient(135deg, #2d2d2d 0%, #3a3a3a 100%) !important;
             border: 1px solid #4a4a4a !important;
-            border-left-color: #f8842c !important;
+            border-left-color: $AccentColor !important;
         }
 
         .content table {
@@ -1306,7 +1565,7 @@ function Get-RjRbReportEmailBody {
         }
 
         .content th {
-            background: #f8842c !important;
+            background: $AccentColor !important;
             color: #ffffff !important;
         }
 
@@ -1317,7 +1576,7 @@ function Get-RjRbReportEmailBody {
         .attachments {
             background: linear-gradient(135deg, #2d2d2d 0%, #3a3a3a 100%) !important;
             border: 1px solid #4a4a4a !important;
-            border-left-color: #f8842c !important;
+            border-left-color: $AccentColor !important;
         }
 
         .attachment-item {
@@ -1333,7 +1592,7 @@ function Get-RjRbReportEmailBody {
 
         .content blockquote {
             background: linear-gradient(135deg, #2d2d2d 0%, #3a3a3a 100%) !important;
-            border-left-color: #f8842c !important;
+            border-left-color: $AccentColor !important;
         }
     }
 </style>
@@ -1351,33 +1610,48 @@ function Get-RjRbReportEmailBody {
        than Word's page content area). Modern clients keep the grey,
        centered layout from the main style block. */
     body { background-color: #ffffff; }
-    .email-container { background-color: #ffffff; width: 750px; }
-    /* padding:0 - the MSO inner wrapper td carries the 48px content padding;
-       Word builds that honor div padding would otherwise double it to 96px. */
-    .content { background-color: #ffffff; padding: 0; }
+    /* .email-container is hidden from Word behind an [if !mso] wrapper - the card
+       is the three MSO tables below, so no width rule for it here.
+       The divs only carry the tables now: strip every source of vertical space so
+       the three tables stack seamlessly. A gap here would read as a hairline
+       between banner and content. */
+    .header, .content, .footer {
+        margin: 0;
+        padding: 0;
+        mso-margin-top-alt: 0;
+        mso-margin-bottom-alt: 0;
+        mso-line-height-rule: exactly;
+    }
+    .header, .footer { font-size: 0; line-height: 0; }
+    .content { background-color: #ffffff; }
 
     /* MSO Font Fallback - Outlook Classic cannot load Google Fonts */
     body, p, li, td, th, h1, h2, h3, h4, h5, h6, div, span, a, blockquote {
         font-family: 'Segoe UI', Arial, Helvetica, sans-serif !important;
     }
 
-    /* MSO Table Fixes + width lock backstop.
-       The Word engine uses automatic table layout and grows a table to fit
-       its widest cell, ignoring width="100%". A wide table would stretch the
-       .content cell and push the card past the fixed-width 750px header and
-       footer images, leaving an empty strip beside them. table-layout:fixed
-       makes Word honor declared widths and wrap long cell values natively at
-       the cell boundary (word-break/overflow-wrap CSS are no-ops in Word -
-       fixed layout is the actual wrapping mechanism).
-       IMPORTANT: Word applies element and class selectors reliably, but
-       descendant selectors like ".content table" only unreliably - never
-       hang critical rules on a descendant selector in this block. The
-       critical layers are the inline table-layout:fixed styles on the outer
-       750px wrapper, the inner content wrapper and every MSO-only twin
-       table; the two rules below are the backstop for the markdown data
-       tables (class "table") and for any table inside caller-supplied
-       HtmlContent. A table that must keep automatic layout opts out via
-       inline table-layout:auto (see the task-list table). */
+    /* MSO table spacing.
+       CORRECTION - the previous version of this comment claimed that
+       table-layout:fixed "makes Word honor declared widths and wrap long cell
+       values natively at the cell boundary" and called fixed layout "the actual
+       wrapping mechanism". Both halves are false, measured twice: Word does not
+       implement table-layout at all (an OOXML round-trip of this markup never
+       emits <w:tblLayout>, and the same table measures an identical grid under
+       fixed and under auto). A table's rendered grid is
+       max(declared width, min-content width) - declared widths are treated
+       strictly as preferences and the content minimum always wins.
+       Believing this comment is what mis-scoped the real wrapping mechanism:
+       Word offers a line break ONLY at whitespace, '-', U+00AD and U+200B, so
+       the only thing that actually keeps a wide table inside the card is the
+       U+200B insertion in Add-RjRbCellSoftBreaks, backed by the 48px gutter
+       columns of the MSO content row, which Word CAN shrink.
+       The declarations below are kept because they are measured inert here and
+       cost nothing, and because deleting them has no measured upside on the one
+       client that matters (Outlook Classic on Windows); mso-table-lspace/rspace
+       are the part that does real work.
+       Still true and worth keeping: Word applies element and class selectors
+       reliably, but descendant selectors like ".content table" only
+       unreliably - never hang a critical rule on a descendant selector here. */
     table { mso-table-lspace: 0pt; mso-table-rspace: 0pt; border-collapse: collapse; table-layout: fixed; }
     .table { table-layout: fixed; }
 
@@ -1435,41 +1709,50 @@ function Get-RjRbReportEmailBody {
 <body>
 
     <!--[if mso]>
-    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="750" align="center" style="width:750px;table-layout:fixed;border-collapse:collapse;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="750" align="center" style="width:750px;border-collapse:collapse;border:1px solid #d1d5db;">
     <tr>
-    <td width="750" style="width:750px;background-color:#ffffff;border:1px solid #d1d5db;">
+    <td width="750" style="width:750px;background-color:#ffffff;">
     <![endif]-->
+    <!--[if !mso]><!-->
     <div class="email-container">
+    <!--<![endif]-->
         $(if ($IncludeHeader) {
             @"
         <div class='header'>
+            <!--[if mso]>
+            $msoSectionTableOpen
+            <tr>
+            <td width="750" style="width:750px;padding:0;font-size:0;line-height:0;">
+            <![endif]-->
             <!-- keep src/alt/width of the mso and non-mso img in sync -->
             <!--[if mso]><img src='cid:header' alt='$HeaderAltText' width='750' style='width:750px;display:block;border:0;' /><![endif]-->
             <!--[if !mso]><!--><img class='header-img' src='cid:header' alt='$HeaderAltText' width='750' /><!--<![endif]-->
+            <!--[if mso]></td></tr></table><![endif]-->
         </div>
 "@
         })
 
         <div class="content">
             <!--[if mso]>
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;">
+            $msoSectionTableOpen
             <tr>
-            <td style="padding:48px;">
+            $msoGutterCell
+            <td width="654" style="width:654px;padding:48px 0;" valign="top">
             <![endif]-->
 
             $($HtmlContent)
 
             $(if ($IncludeTenantInfo) {
-                @'
+                @"
             <!--[if mso]>
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-top:32px;width:100%;table-layout:fixed;border-collapse:collapse;"><tr>
-            <td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid #f8842c;padding:6px 20px;font-size:14px;" valign="top">
+            <td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid $AccentColor;padding:6px 20px;font-size:14px;" valign="top">
             <![endif]-->
             <!--[if !mso]><!-->
-            <div class="tenant-info" style="background:#e8ebed;border:1px solid #e0e7ff;border-left:4px solid #f8842c;padding:10px 20px;border-radius:8px;font-size:14px;margin-top:32px;">
+            <div class="tenant-info" style="background:#e8ebed;border:1px solid #e0e7ff;border-left:4px solid $AccentColor;padding:10px 20px;border-radius:8px;font-size:14px;margin-top:32px;">
             <!--<![endif]-->
                 <p style="margin:0;padding:0;mso-line-height-rule:exactly;">
-'@
+"@
             })
 
             $(if ($IncludeTenantInfo -and -not [string]::IsNullOrEmpty($TenantDisplayName)) {
@@ -1502,10 +1785,10 @@ function Get-RjRbReportEmailBody {
             <!--[if mso]>
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="width:100%;table-layout:fixed;"><tr><td style="font-size:1px;line-height:16px;height:16px;">&nbsp;</td></tr></table>
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;"><tr>
-            <td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid #f8842c;padding:6px 20px;font-size:14px;" valign="top">
+            <td bgcolor="#e8ebed" style="background-color:#e8ebed;border-left:4px solid $AccentColor;padding:6px 20px;font-size:14px;" valign="top">
             <![endif]-->
             <!--[if !mso]><!-->
-            <div class="attachments" style="background:#e8ebed;border:1px solid #e0e7ff;border-left:4px solid #f8842c;border-radius:8px;padding:10px 20px;margin-top:16px;">
+            <div class="attachments" style="background:#e8ebed;border:1px solid #e0e7ff;border-left:4px solid $AccentColor;border-radius:8px;padding:10px 20px;margin-top:16px;">
             <!--<![endif]-->
                 <h3 style="margin:0 0 6px 0;padding:0;mso-margin-top-alt:0;mso-margin-bottom-alt:6px;">Attached Files</h3>
                 <div class="attachment-list">
@@ -1522,23 +1805,32 @@ function Get-RjRbReportEmailBody {
             })
             <!--[if mso]>
             </td>
+            $msoGutterCell
             </tr>
             </table>
             <![endif]-->
         </div>
 
         $(if ($IncludeFooter) {
-            @"        
+            @"
         <div class="footer">
+            <!--[if mso]>
+            $msoSectionTableOpen
+            <tr>
+            <td width="750" style="width:750px;padding:0;font-size:0;line-height:0;">
+            <![endif]-->
             <a href="$FooterLink" target="_blank" title="Visit $FooterLink" style="display:block;border:0;outline:none;text-decoration:none;">
                 <!-- keep src/alt/width of the mso and non-mso img in sync -->
                 <!--[if mso]><img src="cid:footer" alt="$FooterAltText" width="750" border="0" style="width:750px;display:block;border:0;" /><![endif]-->
                 <!--[if !mso]><!--><img class="footer-img" src="cid:footer" alt="$FooterAltText" width="750" border="0" style="display:block;width:100%;max-width:750px;height:auto;border:0;outline:none;text-decoration:none;" /><!--<![endif]-->
             </a>
+            <!--[if mso]></td></tr></table><![endif]-->
         </div>
 "@
         })
+    <!--[if !mso]><!-->
     </div>
+    <!--<![endif]-->
     <!--[if mso]>
     </td>
     </tr>
@@ -1630,6 +1922,21 @@ function Send-RjRbReportEmail {
         Optional array of file paths to include as attachments. Files that exist will be read,
         base64-encoded and included as file attachments. Missing files are logged and skipped.
 
+        .PARAMETER FallbackAttachments
+        Optional smaller attachment set used when the regular set exceeds the size budget
+        (-MaxAttachmentBytes) or the send attempt with the regular set fails for every
+        recipient. Without this parameter there is no fallback - a failed send throws
+        immediately. Replaces the former inline runbook helper Send-RjRbGuardedReportEmail.
+
+        .PARAMETER FallbackMarkdownContent
+        Markdown body used when the fallback attachment set is sent. Defaults to
+        -MarkdownContent when omitted.
+
+        .PARAMETER MaxAttachmentBytes
+        Raw size budget for the regular attachment set (default 2.5MB - stays safely below
+        the ~4 MB Graph sendMail request limit after base64 encoding, HTML body and inline
+        branding image overhead). Only evaluated when -FallbackAttachments is provided.
+
         .PARAMETER TenantDisplayName
         Optional display name for the tenant/organization that will be shown in the email footer
         and tenant info box.
@@ -1670,6 +1977,18 @@ function Send-RjRbReportEmail {
 
         .PARAMETER NoFooter
         Suppress the footer graphic and the overlay tagline/links entirely.
+
+        .PARAMETER AccentColor
+        Optional accent color override (6-digit hex, e.g. '#0052cc') for table headers,
+        buttons, accent borders and the horizontal rule. When empty or invalid, the
+        default RealmJoin orange '#f8842c' is used - an invalid value writes a warning
+        and never aborts the send. With no override the generated email is identical
+        to previous module versions.
+
+        .PARAMETER TextColor
+        Optional primary text color override (6-digit hex) for body text, headings and
+        code. When empty or invalid, the default RealmJoin navy '#011e33' is used -
+        same fallback behaviour as -AccentColor.
 
         .PARAMETER UseNativeGraphRequest
         Send the message via the native Microsoft.Graph cmdlet Invoke-MgGraphRequest
@@ -1716,6 +2035,12 @@ function Send-RjRbReportEmail {
 
         [string[]]$Attachments = @(),
 
+        [string[]]$FallbackAttachments,
+
+        [string]$FallbackMarkdownContent,
+
+        [long]$MaxAttachmentBytes = 2.5MB,
+
         [bool]$saveToSentItems = $true,
 
         [string]$TenantDisplayName,
@@ -1735,6 +2060,12 @@ function Send-RjRbReportEmail {
 
         [switch]$NoFooter,
 
+        # Color overrides are NOT strictly validated at parameter binding so that an
+        # invalid value falls back to the default instead of aborting the whole send.
+        [string]$AccentColor,
+
+        [string]$TextColor,
+
         [switch]$UseNativeGraphRequest
     )
 
@@ -1751,8 +2082,65 @@ function Send-RjRbReportEmail {
 
     Write-RjRbLog -Message "Parsed $($emailRecipients.Count) recipient(s) from EmailTo parameter" -Verbose
 
+    # --- Resolve optional color overrides -----------------------------------
+    # Invalid values fall back to the template defaults (warning, never abort).
+    $rjRbColorParams = @{}
+    foreach ($colorOverride in @(
+            @{ Name = 'AccentColor'; Value = $AccentColor },
+            @{ Name = 'TextColor'; Value = $TextColor })) {
+        if ([string]::IsNullOrWhiteSpace($colorOverride.Value)) { continue }
+        $candidate = $colorOverride.Value.Trim()
+        if ($candidate -match '^#[0-9A-Fa-f]{6}$') {
+            $rjRbColorParams[$colorOverride.Name] = $candidate
+        }
+        else {
+            Write-RjRbForcedWarning -Message "$($colorOverride.Name) '$($colorOverride.Value)' is not a 6-digit hex color (e.g. '#0052cc') - using the default color instead."
+        }
+    }
+
+    # --- Attachment size guard (optional fallback set) ----------------------
+    # Replaces the former inline runbook helper Send-RjRbGuardedReportEmail: when the
+    # regular attachment set exceeds the raw size budget, the fallback set is sent
+    # instead; when the send with the regular set fails for every recipient, one retry
+    # with the fallback set is attempted. Both paths delegate to a recursive call that
+    # carries no fallback parameters, so the recursion depth is always 1.
+    $sizeLimitHint = "If the attachments exceed the email size limit, choose a different report file format or enable the download link option (CreateDownloadLink) to deliver the files."
+    $fallbackSet = @($FallbackAttachments | Where-Object { $_ })
+    $regularSet = @($Attachments | Where-Object { $_ })
+    $hasFallback = ($fallbackSet.Count -gt 0) -and ($regularSet.Count -gt 0)
+
+    $fallbackRetryParams = $null
+    if ($hasFallback) {
+        $fallbackRetryParams = @{}
+        foreach ($boundParam in $PSBoundParameters.GetEnumerator()) { $fallbackRetryParams[$boundParam.Key] = $boundParam.Value }
+        $null = $fallbackRetryParams.Remove('FallbackAttachments')
+        $null = $fallbackRetryParams.Remove('FallbackMarkdownContent')
+        $null = $fallbackRetryParams.Remove('MaxAttachmentBytes')
+        $fallbackRetryParams['Attachments'] = $fallbackSet
+        if (-not [string]::IsNullOrEmpty($FallbackMarkdownContent)) { $fallbackRetryParams['MarkdownContent'] = $FallbackMarkdownContent }
+
+        # Graph sendMail rejects the whole request at ~4 MB; attachments count
+        # base64-encoded (+33%), plus HTML body and inline branding images. Above the
+        # raw budget the fallback set is sent directly.
+        $totalBytes = ($regularSet | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { (Get-Item -LiteralPath $_).Length } | Measure-Object -Sum).Sum
+        if (-not $totalBytes) { $totalBytes = 0 }
+        if ($totalBytes -gt $MaxAttachmentBytes) {
+            # Pick a unit that doesn't round small values to "0 MB"
+            $totalDisplay = if ($totalBytes -ge 1MB) { "$([math]::Round($totalBytes / 1MB, 2)) MB" } else { "$([math]::Round($totalBytes / 1KB, 1)) KB" }
+            $budgetDisplay = if ($MaxAttachmentBytes -ge 1MB) { "$([math]::Round($MaxAttachmentBytes / 1MB, 2)) MB" } else { "$([math]::Round($MaxAttachmentBytes / 1KB, 1)) KB" }
+            Write-Output "The attachments total $totalDisplay and exceed the email attachment budget of $budgetDisplay - sending the reduced attachment set instead."
+            try {
+                Send-RjRbReportEmail @fallbackRetryParams
+                return
+            }
+            catch {
+                throw "Failed to send email report: $($_.Exception.Message). $sizeLimitHint"
+            }
+        }
+    }
+
     # Convert Markdown to HTML using helper function
-    $htmlContent = ConvertFrom-RjRbMarkdownToHtml -MarkdownText $MarkdownContent
+    $htmlContent = ConvertFrom-RjRbMarkdownToHtml -MarkdownText $MarkdownContent @rjRbColorParams
 
     Write-RjRbLog -Message "Successfully converted Markdown content to HTML" -Verbose
 
@@ -1907,7 +2295,8 @@ function Send-RjRbReportEmail {
         -IncludeTenantInfo `
         -IncludeHeader:$includeHeader `
         -IncludeFooter:$includeFooter `
-        -FooterLink $FooterLink
+        -FooterLink $FooterLink `
+        @rjRbColorParams
 
     # --- Ensure a Graph connection is active --------------------------------
     # Send-RjRbReportEmail is typically the first/only Graph touchpoint in a
@@ -2001,12 +2390,164 @@ function Send-RjRbReportEmail {
         Write-RjRbLog -Message "Failed recipients: $failedList" -Verbose
 
         if ($successfulSends -eq 0) {
+            # Safety net: retry once with the fallback set if the full set was just attempted
+            if ($hasFallback) {
+                Write-Output "Sending the email with all attachments failed - retrying with the reduced attachment set..."
+                try {
+                    Send-RjRbReportEmail @fallbackRetryParams
+                    return
+                }
+                catch {
+                    throw "Failed to send email report (retry with the reduced attachment set also failed): $($_.Exception.Message). $sizeLimitHint"
+                }
+            }
             throw "Failed to send email to all recipients: $failedList"
         }
         else {
             Write-RjRbForcedWarning -Message "Some emails failed to send. Failed recipients: $failedList"
         }
     }
+}
+
+function Get-RjRbBrandingMailParams {
+    <#
+        .SYNOPSIS
+        Resolves the tenant email branding settings into Send-RjReportEmail parameters.
+
+        .DESCRIPTION
+        Downloads the custom header/footer image configured via the RJReport.Branding.*
+        tenant settings to a temp file, validates it (HTTPS only, PNG/JPEG/GIF by file
+        signature, size cap) and returns a hashtable ready to splat into
+        Send-RjReportEmail / Send-RjRbGuardedReportEmail.
+
+        A missing setting, a broken URL or an invalid image NEVER fails the report send:
+        the affected key is simply omitted (warning logged) and the module falls back to
+        the bundled default graphics. Images are downloaded once per run - reuse the
+        returned hashtable for every email sent by this job.
+
+        .PARAMETER HeaderImageUrl
+        Public HTTPS URL of the custom header image (RJReport.Branding.HeaderImageUrl).
+
+        .PARAMETER FooterImageUrl
+        Public HTTPS URL of the custom footer image (RJReport.Branding.FooterImageUrl).
+
+        .PARAMETER FooterLink
+        URL the footer image links to (RJReport.Branding.FooterLink).
+
+        .PARAMETER AccentColor
+        Accent color override (RJReport.Branding.AccentColor). Passed through to
+        Send-RjReportEmail, which validates the value and falls back to the default
+        on an invalid color.
+
+        .PARAMETER TextColor
+        Text color override (RJReport.Branding.TextColor). Same handling as -AccentColor.
+
+        .PARAMETER TimeoutSec
+        Download timeout per image in seconds.
+
+        .PARAMETER MaxImageBytes
+        Maximum accepted image file size. Branding images count against the ~4 MB Graph
+        sendMail request limit together with the report attachments, so they must stay small.
+    #>
+    param(
+        [string]$HeaderImageUrl,
+        [string]$FooterImageUrl,
+        [string]$FooterLink,
+        [string]$AccentColor,
+        [string]$TextColor,
+        [int]$TimeoutSec = 30,
+        [long]$MaxImageBytes = 200KB
+    )
+
+    $brandingParams = @{}
+    if (-not [string]::IsNullOrWhiteSpace($FooterLink)) {
+        $brandingParams.FooterLink = $FooterLink.Trim()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AccentColor)) {
+        $brandingParams.AccentColor = $AccentColor.Trim()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TextColor)) {
+        $brandingParams.TextColor = $TextColor.Trim()
+    }
+
+    $images = @(
+        @{ Kind = 'header'; Url = $HeaderImageUrl; ParamName = 'HeaderImage' },
+        @{ Kind = 'footer'; Url = $FooterImageUrl; ParamName = 'FooterImage' }
+    )
+
+    foreach ($image in $images) {
+        if ([string]::IsNullOrWhiteSpace($image.Url)) { continue }
+        $url = $image.Url.Trim()
+        $tempFile = $null
+        try {
+            $uri = [System.Uri]$url
+            if ($uri.Scheme -ne 'https') {
+                throw "Only HTTPS URLs are supported (got '$url')."
+            }
+
+            $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) `
+                ("RjRbBranding-$($image.Kind)-" + [System.Guid]::NewGuid().ToString('N') + '.tmp')
+
+            # Ensure TLS 1.2 on Windows PowerShell 5.1 (no-op on PowerShell 7)
+            [System.Net.ServicePointManager]::SecurityProtocol = `
+                [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+            $previousProgressPreference = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $tempFile -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop | Out-Null
+            }
+            finally {
+                $ProgressPreference = $previousProgressPreference
+            }
+
+            $fileItem = Get-Item -LiteralPath $tempFile -ErrorAction Stop
+            if ($fileItem.Length -eq 0) { throw "The downloaded file is empty." }
+            if ($fileItem.Length -gt $MaxImageBytes) {
+                throw "The image is $([math]::Round($fileItem.Length / 1KB, 1)) KB and exceeds the $([math]::Round($MaxImageBytes / 1KB, 0)) KB limit for inline email images."
+            }
+
+            # Determine the actual image format from the file signature - the URL may have a
+            # wrong extension or none at all, and Send-RjReportEmail validates by extension.
+            $magic = New-Object byte[] 8
+            $stream = [System.IO.File]::OpenRead($tempFile)
+            try { [void]$stream.Read($magic, 0, 8) } finally { $stream.Dispose() }
+
+            $extension = $null
+            if ($magic[0] -eq 0x89 -and $magic[1] -eq 0x50 -and $magic[2] -eq 0x4E -and $magic[3] -eq 0x47 -and
+                $magic[4] -eq 0x0D -and $magic[5] -eq 0x0A -and $magic[6] -eq 0x1A -and $magic[7] -eq 0x0A) {
+                $extension = '.png'
+            }
+            elseif ($magic[0] -eq 0xFF -and $magic[1] -eq 0xD8 -and $magic[2] -eq 0xFF) {
+                $extension = '.jpg'
+            }
+            elseif ($magic[0] -eq 0x47 -and $magic[1] -eq 0x49 -and $magic[2] -eq 0x46 -and $magic[3] -eq 0x38 -and
+                ($magic[4] -eq 0x37 -or $magic[4] -eq 0x39) -and $magic[5] -eq 0x61) {
+                $extension = '.gif'
+            }
+            if (-not $extension) {
+                throw "The downloaded file is not a PNG, JPEG or GIF image (unrecognized file signature)."
+            }
+
+            $finalFile = [System.IO.Path]::ChangeExtension($tempFile, $extension)
+            Move-Item -LiteralPath $tempFile -Destination $finalFile -Force -ErrorAction Stop
+            $tempFile = $null
+
+            $brandingParams[$image.ParamName] = $finalFile
+            Write-RjRbLog -Message "Branding: using the custom $($image.Kind) image from '$url' ($([math]::Round($fileItem.Length / 1KB, 1)) KB, $extension)" -Verbose
+        }
+        catch {
+            Write-RjRbLog -Message "WARNING: Branding: the custom $($image.Kind) image from '$url' could not be used - the default image is used instead. $($_.Exception.Message)" -Verbose
+            # Write-Warning (not Write-Output): inside this value-returning function, Write-Output
+            # would pollute the returned hashtable and break splatting at the call sites.
+            Write-Warning -Message "The custom $($image.Kind) image could not be downloaded or is not a usable image - the report email uses the default $($image.Kind) image instead."
+            if ($tempFile -and (Test-Path -LiteralPath $tempFile)) {
+                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    return $brandingParams
 }
 
 # Backwards-compatible alias: the original public name was Send-RjReportEmail.

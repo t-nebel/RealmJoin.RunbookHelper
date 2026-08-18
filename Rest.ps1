@@ -249,3 +249,119 @@ function invokeRjRbRestMethodInternal {
 
     return $result
 }
+
+function Invoke-RjRbGraphBatch {
+    <#
+        .SYNOPSIS
+        Sends requests to the Microsoft Graph JSON batch endpoint in chunks of 20,
+        with automatic retries for throttled inner requests.
+
+        .DESCRIPTION
+        The Graph $batch endpoint returns 200 for the outer call even when individual
+        inner requests are throttled with status 429. Throttled inner requests are
+        retried after the Retry-After interval reported by the service (up to
+        -MaxRetries attempts). Outer 429 responses are already retried by the Graph
+        SDK itself.
+
+        Building the batch requests (id, method, url and optional headers/body) stays
+        with the caller - this function only handles chunking, transport and
+        throttling. Responses are returned in completion order; correlate them to the
+        requests via their id property.
+
+        Requires an active Microsoft.Graph session (Connect-MgGraph); declare the
+        Microsoft.Graph.Authentication module in the consuming runbook via #Requires.
+
+        .PARAMETER Requests
+        The batch request objects (id, method, url, optional headers/body).
+
+        .PARAMETER ProgressLabel
+        Label used in progress log lines, e.g. "adds" or "removes". Defaults to "requests".
+
+        .PARAMETER ProgressInterval
+        Emit a progress log line (Write-RjRbLog, verbose stream) every N batch calls
+        (N * 20 requests). Defaults to 25; set 0 to disable.
+
+        .PARAMETER MaxRetries
+        Maximum retry rounds for throttled inner requests per chunk. Defaults to 5.
+        Requests still throttled after the last round are returned with their 429
+        status so the caller can count them as failures.
+
+        .PARAMETER Beta
+        Use the beta endpoint (https://graph.microsoft.com/beta/$batch) instead of v1.0.
+
+        .OUTPUTS
+        System.Object[]. One response object per request (id, status, headers, body).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Requests,
+
+        [string]$ProgressLabel = "requests",
+
+        [int]$ProgressInterval = 25,
+
+        [int]$MaxRetries = 5,
+
+        [switch]$Beta
+    )
+
+    # Graph batch API: max 20 requests per call
+    $batchSize = 20
+    $apiVersion = if ($Beta) { 'beta' } else { 'v1.0' }
+    $batchUri = "https://graph.microsoft.com/$apiVersion/`$batch"
+    $responses = [System.Collections.Generic.List[object]]::new()
+    $batchNumber = 0
+
+    for ($i = 0; $i -lt $Requests.Count; $i += $batchSize) {
+        $chunk = @($Requests[$i..([Math]::Min($i + $batchSize - 1, $Requests.Count - 1))])
+        $batchNumber++
+
+        $pending = $chunk
+        $attempt = 0
+        while ($pending.Count -gt 0) {
+            $batchBody = @{ requests = @($pending) }
+            $batchResult = Invoke-MgGraphRequest -Uri $batchUri -Method POST -Body $batchBody
+
+            # Inner requests can be throttled individually even though the outer call succeeded
+            $throttled = @($batchResult.responses | Where-Object { $_.status -eq 429 })
+            $final = @($batchResult.responses | Where-Object { $_.status -ne 429 })
+            if ($final.Count -gt 0) {
+                $responses.AddRange([object[]]$final)
+            }
+
+            if ($throttled.Count -eq 0) {
+                break
+            }
+
+            $attempt++
+            if ($attempt -gt $MaxRetries) {
+                # Give up - the remaining throttled responses are counted as failures by the caller
+                $responses.AddRange([object[]]$throttled)
+                Write-RjRbLog -Message "Giving up on $($throttled.Count) request(s) still throttled after $MaxRetries retries." -Verbose
+                break
+            }
+
+            # Honor the longest Retry-After the service returned (fallback 10 seconds)
+            $retryAfter = 10
+            foreach ($response in $throttled) {
+                $headerValue = $response.headers.'Retry-After' -as [int]
+                if ($headerValue -and $headerValue -gt $retryAfter) {
+                    $retryAfter = $headerValue
+                }
+            }
+            Write-RjRbLog -Message "Graph throttled $($throttled.Count) request(s) (attempt $attempt/$MaxRetries) - waiting $retryAfter seconds..." -Verbose
+            Start-Sleep -Seconds $retryAfter
+
+            $throttledIds = [System.Collections.Generic.HashSet[string]]::new([string[]]@($throttled | ForEach-Object { "$($_.id)" }))
+            $pending = @($pending | Where-Object { $throttledIds.Contains("$($_.id)") })
+        }
+
+        # Progress heartbeat via the verbose log stream. Deliberately NOT Write-Output:
+        # inside a value-returning function that would pollute the returned response list.
+        if ($ProgressInterval -gt 0 -and $batchNumber % $ProgressInterval -eq 0) {
+            Write-RjRbLog -Message "Invoke-RjRbGraphBatch: processed $([Math]::Min($i + $batchSize, $Requests.Count)) of $($Requests.Count) $ProgressLabel..." -Verbose
+        }
+    }
+
+    return $responses
+}

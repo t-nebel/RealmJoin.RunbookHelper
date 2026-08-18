@@ -2,7 +2,7 @@
 
 @{
     RootModule        = 'RealmJoin.RunbookHelper.psm1'
-    ModuleVersion     = '0.8.8'
+    ModuleVersion     = '0.8.9'
     GUID              = '50c59179-6cb8-4968-bf76-e7de04f02957'
     Author            = 'glueckkanja AG'
     CompanyName       = 'glueckkanja AG'
@@ -18,6 +18,7 @@
         'Connect-RjRbAzAccount', 'Connect-RjRbAzureAD', 'Get-RjRbAzureADTenantDetail', 'Connect-RjRbExchangeOnline',
         'Connect-RjRbGraph', 'Connect-RjRbDefenderATP', 'Send-RjRbReportEmail',
         'ConvertFrom-RjRbMarkdownToHtml', 'Get-RjRbReportEmailBody', 'Resolve-RjRbImageSource',
+        'Get-RjRbBrandingMailParams', 'Invoke-RjRbGraphBatch',
         'Publish-RjRbFilesToStorageContainer', 'Export-RjRbXlsx',
         'Publish-RjRbKeyVaultSecret', 'Publish-RjRbKeyVaultKey', 'Publish-RjRbKeyVaultCertificate'
     )
@@ -57,7 +58,7 @@
             #   and Publish-RjRbKeyVaultCertificate.
             # - Az.Resources: required by the Key Vault publish helpers for Get/New-AzRoleAssignment.
             # - Microsoft.Graph.Authentication: only required by Send-RjRbReportEmail when
-            #   -UseNativeGraphRequest is set.
+            #   -UseNativeGraphRequest is set, and by Invoke-RjRbGraphBatch (Invoke-MgGraphRequest).
             ExternalModuleDependencies = @('Az.Accounts', 'Az.KeyVault', 'Az.Resources', 'Microsoft.Graph.Authentication')
         }
     }
